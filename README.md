@@ -46,6 +46,12 @@ cd api
 venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+Alternatively, run using the virtualenv's python (safer on Windows):
+
+```powershell
+venv\Scripts\python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
 ```
 
 The API will be available at:
