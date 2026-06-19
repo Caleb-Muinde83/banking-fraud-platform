@@ -1,0 +1,40 @@
+# Python environment and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.python-version
+
+# Virtual environments
+venv/
+env/
+.venv/
+**/venv/
+**/.venv/
+
+# Environment files
+.env
+.env.*
+*.env
+
+# Editor and IDE
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Logs
+*.log
+logs/
+
+# Packaging
+*.egg-info/
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db

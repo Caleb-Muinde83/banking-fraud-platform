@@ -1,0 +1,17 @@
+{
+  "name": "banking-cdc-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "postgres_admin",
+    "database.password": "SecureBankPassword2026!",
+    "database.dbname": "banking_db",
+    "topic.prefix": "banking",
+    "table.include.list": "public.login_events,public.sessions,public.accounts,public.transactions,public.beneficiaries,public.employee_actions",
+    "plugin.name": "pgoutput",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "decimal.handling.mode": "double"
+  }
+}

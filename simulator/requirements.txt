@@ -1,0 +1,5 @@
+requests
+httpx
+faker
+pydantic
+pydantic-settings
