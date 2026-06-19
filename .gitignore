@@ -12,6 +12,8 @@ env/
 .venv/
 **/venv/
 **/.venv/
+api/venv/
+simulator/venv/
 
 # Environment files
 .env
