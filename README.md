@@ -26,6 +26,17 @@ To stop the stack:
 docker compose down
 ```
 
+### Seed the database
+
+After the containers are running, seed a fresh database from the `api` folder:
+
+```powershell
+cd api
+venv\Scripts\activate
+python seed_db.py
+```
+
+
 ### 2. Run the API
 
 From the `api` folder:
