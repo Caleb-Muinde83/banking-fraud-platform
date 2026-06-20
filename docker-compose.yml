@@ -5,7 +5,14 @@ services:
   postgres:
     image: postgres:15-alpine
     container_name: bank_postgres
-    command: ["postgres", "-c", "wal_level=logical"]
+    command: 
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=4"
+      - "-c"
+      - "max_wal_senders=4"
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}

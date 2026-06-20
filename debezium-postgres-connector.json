@@ -8,10 +8,22 @@
     "database.user": "postgres_admin",
     "database.password": "SecureBankPassword2026!",
     "database.dbname": "banking_db",
+    "plugin.name": "pgoutput",
+    
     "topic.prefix": "banking",
     "table.include.list": "public.login_events,public.sessions,public.accounts,public.transactions,public.beneficiaries,public.employee_actions",
-    "plugin.name": "pgoutput",
+    
     "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
-    "decimal.handling.mode": "double"
+    "decimal.handling.mode": "double",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false",
+
+    "transforms": "RouteTable",
+    "transforms.RouteTable.type": "org.apache.kafka.connect.transforms.RegexRouter",
+    "transforms.RouteTable.regex": "banking\\.public\\.(.*)",
+    "transforms.RouteTable.replacement": "banking.$1"
   }
 }

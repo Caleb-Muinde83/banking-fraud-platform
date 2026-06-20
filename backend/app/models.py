@@ -141,3 +141,29 @@ class EmployeeAction(Base):
     customer_id = Column(String, nullable=False)
     action_type = Column(String, nullable=False)  # VIEW_ACCOUNT, MODIFY_ACCOUNT
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+class Alert(Base):
+    __tablename__ = "alerts"
+    alert_id = Column(String, primary_key=True, index=True)
+    alert_type = Column(String)
+    severity = Column(String)
+    customer_id = Column(String, index=True)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+
+class Case(Base):
+    __tablename__ = "cases"
+    case_id = Column(String, primary_key=True, index=True)
+    alert_id = Column(String)
+    status = Column(String, default="OPEN")
+    assignee = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    resolved_at = Column(DateTime, nullable=True)
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+    audit_id = Column(String, primary_key=True, index=True)
+    actor_type = Column(String)
+    actor_id = Column(String)
+    action = Column(String)
+    resource = Column(String)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
