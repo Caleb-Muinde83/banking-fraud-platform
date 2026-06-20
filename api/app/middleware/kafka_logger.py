@@ -1,48 +1,48 @@
-import json
 import uuid
+import time
 import asyncio
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
-from aiokafka import AIOKafkaProducer
-
-# Global producer variable that we will initialize on API startup
-kafka_producer: AIOKafkaProducer = None
+from app.middleware.kafka_producer import send_telemetry_event
 
 class KafkaRequestLoggerMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        request_id = str(uuid.uuid4())
-        
-        # 1. Capture Telemetry
-        ip_address = request.client.host if request.client else "unknown"
-        user_agent = request.headers.get("user-agent", "unknown")
+        # 1. Capture request incoming metadata
+        request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+        ip_address = request.client.host if request.client else "127.0.0.1"
+        user_agent = request.headers.get("user-agent", "Unknown-Device")
         method = request.method
         endpoint = request.url.path
+
+        status_code = 500  # Default fallback in case of an application crash
 
         # 2. Process the actual API request
         try:
             response = await call_next(request)
             status_code = response.status_code
+            return response
         except Exception as e:
-            # If the application crashes, we still want to log the 500 error!
+            # Retain the excellent 500 error logging logic from your original code
             status_code = 500
             raise e
         finally:
-            # 3. Construct the Event Payload
-            log_event = {
+            # 3. Construct our strict Avro telemetry contract payload
+            telemetry_payload = {
                 "request_id": request_id,
                 "ip_address": ip_address,
                 "user_agent": user_agent,
-                "method": method,
                 "endpoint": endpoint,
-                "status_code": status_code
+                "method": method,
+                "status_code": int(status_code),
+                "timestamp": int(time.time() * 1000)
             }
-            
-            # 4. Produce to Kafka (fire-and-forget)
-            if kafka_producer:
-                # We use asyncio.create_task so the API response doesn't have to 
-                # wait for the network call to Kafka to finish.
-                asyncio.create_task(
-                    kafka_producer.send_and_wait("api_requests", log_event)
-                )
 
-        return response
+            # 4. Offload the synchronous Avro validation and Kafka producer call 
+            # to a background thread so the API response isn't blocked.
+            try:
+                asyncio.create_task(
+                    asyncio.to_thread(send_telemetry_event, telemetry_payload)
+                )
+            except Exception as e:
+                # Prevent logging infrastructure failures from crashing the user experience
+                print(f"[CRITICAL LOGGING ERROR] Failed to dispatch telemetry task: {e}")

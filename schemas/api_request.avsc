@@ -1,0 +1,15 @@
+{
+  "type": "record",
+  "name": "APIRequestTelemetry",
+  "namespace": "com.bank.fraud.telemetry",
+  "doc": "Schema enforced telemetry for real-time edge request logging.",
+  "fields": [
+    { "name": "request_id", "type": "string", "doc": "Unique UUID4 identifier for the request lifecycle." },
+    { "name": "ip_address", "type": "string" },
+    { "name": "user_agent", "type": "string" },
+    { "name": "endpoint", "type": "string" },
+    { "name": "method", "type": "string" },
+    { "name": "status_code", "type": "int" },
+    { "name": "timestamp", "type": "long", "doc": "Epoch millisecond invocation time." }
+  ]
+}
