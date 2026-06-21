@@ -15,7 +15,7 @@ docker compose up -d
 
 The stack starts:
 - `postgres` on `localhost:5433`
-- `kafka` on `localhost:9092`
+- `kafka` on `localhost:29092`
 - `connect` on `localhost:8083`
 
 The root `.env` file contains required settings for `docker compose`.
@@ -214,7 +214,7 @@ curl.exe -X POST -H "Content-Type: application/json" -d @F:\DaTech-kafka\banking
 Interrogate the Confluent broker instance internally to confirm that clean, transformed topics exist without `.public.` schema markers:
 
 ```powershell
-docker exec -it bank_kafka kafka-topics --bootstrap-server localhost:9092 --list
+docker exec -it bank_kafka kafka-topics --bootstrap-server localhost:29092 --list
 ```
 
 ### Command 3: Tail the Live Mutation Stream
@@ -222,7 +222,7 @@ docker exec -it bank_kafka kafka-topics --bootstrap-server localhost:9092 --list
 Open a dedicated, persistent consumer window to observe incoming row modifications. For example, to track the `accounts` ledger space:
 
 ```powershell
-docker exec -it bank_kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic banking.accounts --from-beginning
+docker exec -it bank_kafka kafka-console-consumer --bootstrap-server localhost:29092 --topic banking.accounts --from-beginning
 ```
 
 ### Command 4: Trigger a Simulation Mutation

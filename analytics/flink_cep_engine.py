@@ -1,14 +1,13 @@
 import os
+import urllib.request
+from pathlib import Path
 from pyflink.table import EnvironmentSettings, TableEnvironment
 
 def main():
     # =========================================================================
-    # 1. ENVIRONMENT CONFIGURATION
+    # 1. ENVIRONMENT CONFIGURATION & JAR AUTOMATION
     # =========================================================================
-    # Toggle this depending on where you are executing this script:
-    # - Use 'localhost:9092' when running locally inside your host terminal .venv
-    # - Use 'kafka:29092' when submitting this script directly inside the Docker cluster
-    KAFKA_BROKER = os.getenv("KAFKA_BOOTSTRAP_SERVER", "localhost:9092")
+    KAFKA_BROKER = os.getenv("KAFKA_BOOTSTRAP_SERVER", "localhost:29092")
     
     settings = EnvironmentSettings.in_streaming_mode()
     t_env = TableEnvironment.create(settings)
@@ -19,85 +18,133 @@ def main():
     print(f"🚀 Initializing PyFlink Engine [Target Broker: {KAFKA_BROKER}]")
     print("=====================================================================")
 
-    # Inject external Java dependencies at runtime to process Kafka streams & Debezium JSON
-    print("[Flink Init] Downloading Kafka and Debezium JSON Format JARs...")
+    # Setup local directory to cache JAR files to bypass Flink's lack of HTTPS support
+    BASE_DIR = Path(__file__).resolve().parent.parent
+    LIBS_DIR = BASE_DIR / "libs"
+    LIBS_DIR.mkdir(exist_ok=True)
+
+    kafka_jar_url = "https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.0.1-1.18/flink-sql-connector-kafka-3.0.1-1.18.jar"
+    json_jar_url = "https://repo1.maven.org/maven2/org/apache/flink/flink-json/1.18.0/flink-json-1.18.0.jar"
+
+    kafka_jar_path = LIBS_DIR / "flink-sql-connector-kafka-3.0.1-1.18.jar"
+    json_jar_path = LIBS_DIR / "flink-json-1.18.0.jar"
+
+    print("[Flink Init] Checking local dependency JARs...")
+    if not kafka_jar_path.exists():
+        print(f"📥 Downloading Kafka Connector JAR to: {kafka_jar_path}")
+        urllib.request.urlretrieve(kafka_jar_url, kafka_jar_path)
+
+    if not json_jar_path.exists():
+        print(f"📥 Downloading JSON Format JAR to: {json_jar_path}")
+        urllib.request.urlretrieve(json_jar_url, json_jar_path)
+
+    # Pass local file:/// URIs directly to Flink configuration
     config.set_string(
         "pipeline.jars",
-        "https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.0.1-1.18/flink-sql-connector-kafka-3.0.1-1.18.jar;"
-        "https://repo1.maven.org/maven2/org/apache/flink/flink-json/1.18.0/flink-json-1.18.0.jar"
+        f"{kafka_jar_path.as_uri()};{json_jar_path.as_uri()}"
     )
     
-    # Optimize Flink's managed state time-to-live (TTL) to clear out stale tracking data
-    config.set("table.exec.state.ttl", "15s")
+    config.set_string("table.exec.state.ttl", "15s")
 
     # =========================================================================
-    # 2. SOURCE TABLE DEFINITIONS (Consuming Debezium CDC Streams)
+    # 2. SOURCE TABLE DEFINITIONS (Aligned with your exact Kafka topics)
     # =========================================================================
     print("[Flink Init] Mapping Debezium CDC Relational Streams...")
 
-    # Table A: Login Events (Captured via CDC or App-Telemetry)
+    # Login Events
     t_env.execute_sql(f"""
         CREATE TABLE src_login_events (
-            event_id STRING,
-            customer_id STRING,
-            success BOOLEAN,
-            `timestamp` TIMESTAMP(3),
+            after ROW<
+                event_id STRING,
+                customer_id STRING,
+                success BOOLEAN,
+                `timestamp` STRING
+            >,
+            op STRING,
+
+            event_id AS after.event_id,
+            customer_id AS after.customer_id,
+            success AS after.success,
+            `timestamp` AS CAST(after.`timestamp` AS TIMESTAMP(3)),
+
             WATERMARK FOR `timestamp` AS `timestamp` - INTERVAL '5' SECOND
         ) WITH (
             'connector' = 'kafka',
-            'topic' = 'bank.public.login_events',
+            'topic' = 'banking.login_events',
             'properties.bootstrap.servers' = '{KAFKA_BROKER}',
             'properties.group.id' = 'flink-cep-logins',
             'scan.startup.mode' = 'earliest-offset',
-            'format' = 'debezium-json'
+            'format' = 'json'
         )
     """)
 
-    # Table B: Beneficiary Allocations
+    # Beneficiaries
     t_env.execute_sql(f"""
         CREATE TABLE src_beneficiaries (
-            beneficiary_id STRING,
-            customer_id STRING,
-            account_number STRING,
-            created_at TIMESTAMP(3),
+            after ROW<
+                beneficiary_id STRING,
+                customer_id STRING,
+                account_number STRING,
+                created_at STRING
+            >,
+            op STRING,
+
+            beneficiary_id AS after.beneficiary_id,
+            customer_id AS after.customer_id,
+            account_number AS after.account_number,
+            created_at AS CAST(after.created_at AS TIMESTAMP(3)),
+
             WATERMARK FOR created_at AS created_at - INTERVAL '5' SECOND
         ) WITH (
             'connector' = 'kafka',
-            'topic' = 'bank.public.beneficiaries',
+            'topic' = 'banking.beneficiaries',
             'properties.bootstrap.servers' = '{KAFKA_BROKER}',
             'properties.group.id' = 'flink-cep-beneficiaries',
             'scan.startup.mode' = 'earliest-offset',
-            'format' = 'debezium-json'
+            'format' = 'json'
         )
     """)
 
-    # Table C: Financial Ledger Transactions
+    # Transactions
     t_env.execute_sql(f"""
         CREATE TABLE src_transactions (
-            transaction_id STRING,
-            from_account STRING,
-            to_account STRING,
-            amount DOUBLE,
-            `timestamp` TIMESTAMP(3),
+            after ROW<
+                transaction_id STRING,
+                from_account STRING,
+                to_account STRING,
+                amount DOUBLE,
+                `timestamp` STRING
+            >,
+            op STRING,
+
+            transaction_id AS after.transaction_id,
+            from_account AS after.from_account,
+            to_account AS after.to_account,
+            amount AS after.amount,
+            `timestamp` AS CAST(after.`timestamp` AS TIMESTAMP(3)),
+
             WATERMARK FOR `timestamp` AS `timestamp` - INTERVAL '5' SECOND
         ) WITH (
             'connector' = 'kafka',
-            'topic' = 'bank.public.transactions',
+            'topic' = 'banking.transactions',
             'properties.bootstrap.servers' = '{KAFKA_BROKER}',
             'properties.group.id' = 'flink-cep-transactions',
             'scan.startup.mode' = 'earliest-offset',
-            'format' = 'debezium-json'
+            'format' = 'json'
         )
     """)
 
-    # Table D: Accounts (Identity Mapping Table)
+    # Accounts Table
     t_env.execute_sql(f"""
         CREATE TABLE src_accounts (
             account_id STRING,
-            customer_id STRING
+            customer_id STRING,
+            kafka_time TIMESTAMP(3) METADATA FROM 'timestamp' VIRTUAL,
+            PRIMARY KEY (account_id) NOT ENFORCED,
+            WATERMARK FOR kafka_time AS kafka_time - INTERVAL '5' SECOND
         ) WITH (
             'connector' = 'kafka',
-            'topic' = 'bank.public.accounts',
+            'topic' = 'banking.accounts',
             'properties.bootstrap.servers' = '{KAFKA_BROKER}',
             'properties.group.id' = 'flink-cep-accounts',
             'scan.startup.mode' = 'earliest-offset',
@@ -106,32 +153,33 @@ def main():
     """)
 
     # =========================================================================
-    # 3. DATA STREAM UNIFICATION & IDENTITY RESOLUTION
+    # 3. DATA STREAM UNIFICATION (Using Event-Time Temporal Table Join)
     # =========================================================================
     print("[Flink Processing] Unifying disparate streams into Timeline View...")
     t_env.execute_sql("""
         CREATE VIEW unified_customer_timeline AS
         
-        -- Event Type 1: Failed Authentication
         SELECT customer_id, 'LOGIN_FAILED' AS event_type, `timestamp` AS event_time, 0.0 AS amount
-        FROM src_login_events WHERE success = FALSE
+        FROM src_login_events 
+        WHERE success = FALSE AND (op = 'c' OR op = 'r')
         
         UNION ALL
         
-        -- Event Type 2: High-Risk Infrastructure Mutation
         SELECT customer_id, 'BENEFICIARY_ADD' AS event_type, created_at AS event_time, 0.0 AS amount
         FROM src_beneficiaries
+        WHERE (op = 'c' OR op = 'r')
         
         UNION ALL
         
-        -- Event Type 3: Outbound Transfer (Enriched via streaming identity lookup)
         SELECT a.customer_id, 'TRANSFER' AS event_type, t.`timestamp` AS event_time, CAST(t.amount AS DOUBLE) AS amount
         FROM src_transactions t
-        INNER JOIN src_accounts a ON t.from_account = a.account_id
+        JOIN src_accounts FOR SYSTEM_TIME AS OF t.`timestamp` AS a 
+        ON t.from_account = a.account_id
+        WHERE (t.op = 'c' OR t.op = 'r')
     """)
 
     # =========================================================================
-    # 4. SINK DEFINITION (Where alerts are routed)
+    # 4. SINK DEFINITION
     # =========================================================================
     print("[Flink Sinks] Registering Downstream Fraud Alert Topic...")
     t_env.execute_sql(f"""
@@ -176,11 +224,17 @@ def main():
         )
     """
 
-    # Execute the persistent streaming query
-    t_env.execute_sql(cep_fraud_query)
+    table_result = t_env.execute_sql(cep_fraud_query)
+    
     print("=====================================================================")
-    print(" CEP ENGINE RUNNING: Live scanning for multi-step ATO exploits...")
+    print(" 🚨 CEP ENGINE ACTIVE: Live scanning for multi-step ATO exploits... ")
+    print(" (Press Ctrl+C to terminate the streaming cluster) ")
     print("=====================================================================")
+
+    # Keep the Python process alive to monitor the asynchronous streaming job execution
+    job_client = table_result.get_job_client()
+    if job_client is not None:
+        job_client.get_job_execution_result().result()
 
 if __name__ == '__main__':
     main()

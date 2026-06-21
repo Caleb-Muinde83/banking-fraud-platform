@@ -24,7 +24,7 @@ avro_deserializer = AvroDeserializer(
 string_deserializer = StringDeserializer('utf_8')
 
 consumer = Consumer({
-    'bootstrap.servers': 'localhost:9092',
+    'bootstrap.servers': 'localhost:29092',
     'group.id': 'fraud-phase1-velocity-check-v2', # Bumped group ID to force a fresh read
     'auto.offset.reset': 'earliest'               # <-- CHANGED TO EARLIEST TO READ ALL PAST SIMULATIONS
 })

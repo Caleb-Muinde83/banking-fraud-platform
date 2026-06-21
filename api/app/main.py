@@ -5,10 +5,16 @@ import uuid
 import random
 import decimal
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Depends, HTTPException, Header
 from pydantic import BaseModel
+
+# Load environment variables from repository root .env
+ROOT_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT_DIR / ".env")
 
 # Async Kafka Components
 from aiokafka import AIOKafkaProducer
@@ -28,7 +34,15 @@ import app.models.domain as models
 # =========================================================================
 # ASYNC DATABASE ENGINE & CONFIGURATION
 # =========================================================================
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/fraud_db")
+raw_database_url = os.getenv("DATABASE_URL")
+if raw_database_url and raw_database_url.startswith("postgresql://") and "+asyncpg" not in raw_database_url:
+    raw_database_url = raw_database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+DATABASE_URL = raw_database_url or (
+    f"postgresql+asyncpg://{os.getenv('POSTGRES_USER', 'postgres')}:{os.getenv('POSTGRES_PASSWORD', 'postgres')}@"
+    f"{os.getenv('POSTGRES_HOST', 'localhost')}:{os.getenv('POSTGRES_PORT', '5433')}/"
+    f"{os.getenv('POSTGRES_DB', 'fraud_db')}"
+)
 
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 AsyncSessionLocal = async_sessionmaker(
@@ -59,7 +73,7 @@ app.add_middleware(KafkaRequestLoggerMiddleware)
 @app.on_event("startup")
 async def startup_kafka_producer():
     kafka_logger.kafka_producer = AIOKafkaProducer(
-        bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
+        bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092"),
         value_serializer=lambda v: json.dumps(v).encode('utf-8')
     )
     await kafka_logger.kafka_producer.start()

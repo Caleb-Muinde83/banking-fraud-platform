@@ -4,3 +4,8 @@ sqlalchemy
 psycopg2-binary
 pydantic
 pydantic-settings
+aiokafka
+asyncpg
+confluent-kafka[avro]
+httpx
+python-dotenv
