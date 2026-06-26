@@ -1,7 +1,8 @@
 import os
 import time
+import json
 from collections import defaultdict
-from confluent_kafka import Consumer
+from confluent_kafka import Consumer, Producer
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import StringDeserializer, SerializationContext, MessageField
@@ -23,28 +24,42 @@ avro_deserializer = AvroDeserializer(
 )
 string_deserializer = StringDeserializer('utf_8')
 
+# Set up both Consumer (Input) and Producer (Output to Risk Engine)
+KAFKA_BROKER = 'localhost:29092'
 consumer = Consumer({
-    'bootstrap.servers': 'localhost:29092',
-    'group.id': 'fraud-phase1-velocity-check-v2', # Bumped group ID to force a fresh read
-    'auto.offset.reset': 'earliest'               # <-- CHANGED TO EARLIEST TO READ ALL PAST SIMULATIONS
+    'bootstrap.servers': KAFKA_BROKER,
+    'group.id': 'fraud-phase1-velocity-check-v2', 
+    'auto.offset.reset': 'earliest'               
 })
 consumer.subscribe(['api_requests'])
 
+producer = Producer({'bootstrap.servers': KAFKA_BROKER})
+
 ip_activity_state = defaultdict(list)
+alert_cooldown_state = {}  # NEW: Tracks when an IP was last alerted
+ALERT_COOLDOWN_SEC = 30    # NEW: Keep them in timeout for 30 seconds
 
 # Rule Configuration
 VELOCITY_THRESHOLD = 3      
-TIME_WINDOW_SEC = 10        # <-- RELAXED TO 10 SECONDS TO ACCOUNT FOR NETWORK/HTTP LATENCY
-SENSITIVE_ENDPOINTS = ["/transfers", "/login", "/beneficiaries"] # Shortened to catch partial matches
+TIME_WINDOW_SEC = 10        
+SENSITIVE_ENDPOINTS = ["/transfers", "/login", "/beneficiaries"]
 
 def evaluate_velocity_rule(ip_address: str, endpoint: str, current_time_ms: int):
-    # Match if the sensitive word exists anywhere in the endpoint string
     if not any(sensitive in endpoint for sensitive in SENSITIVE_ENDPOINTS):
         return 
     
     current_time_sec = current_time_ms / 1000.0
+
+    # =========================================================================
+    # 🛡️ THE PENALTY BOX CHECK: Stop the Alert Storm!
+    # =========================================================================
+    if ip_address in alert_cooldown_state:
+        if current_time_sec - alert_cooldown_state[ip_address] < ALERT_COOLDOWN_SEC:
+            # The IP is still in timeout. Skip processing to prevent alert spam.
+            return
+    # =========================================================================
+
     timestamps = ip_activity_state[ip_address]
-    
     timestamps.append(current_time_sec)
     
     # Clean up old events outside the window
@@ -54,8 +69,31 @@ def evaluate_velocity_rule(ip_address: str, endpoint: str, current_time_ms: int)
     print(f"   [RULE CHECK] IP {ip_address} has hit sensitive endpoints {current_count}/{VELOCITY_THRESHOLD} times in last {TIME_WINDOW_SEC}s.")
     
     if current_count >= VELOCITY_THRESHOLD:
-        print(f"\n[🚨 FRAUD ALERT] Rapid Sequential Actions detected!")
-        print(f"   -> IP: {ip_address} hit {endpoint} {current_count} times inside a {TIME_WINDOW_SEC}s window.\n")
+        print(f"\n[🚨 FRAUD ALERT] Rapid Sequential Actions detected! Publishing to Risk Engine...")
+        
+        # Publish alert to the Risk Engine topic
+        alert_payload = {
+            "customer_id": ip_address, 
+            "risk_indicator_type": "VELOCITY_VIOLATION",
+            "endpoint": endpoint,
+            "hits": current_count,
+            "window_sec": TIME_WINDOW_SEC,
+            "timestamp": current_time_ms
+        }
+        
+        producer.produce(
+            'fraud_alerts', 
+            key=ip_address, 
+            value=json.dumps(alert_payload)
+        )
+        producer.flush()
+
+        # =========================================================================
+        # 🛑 DROP THE IP INTO THE PENALTY BOX
+        # =========================================================================
+        alert_cooldown_state[ip_address] = current_time_sec
+        # We also clear their activity state so they start fresh after cooldown
+        ip_activity_state[ip_address] = []
 
 print("Phase 1 Rules Engine started. Listening for telemetry...")
 ctx = SerializationContext("api_requests", MessageField.VALUE)
@@ -70,21 +108,16 @@ try:
             print(f"Consumer error: {msg.error()}")
             continue
 
-        # --- UPDATED REGION: Handle legacy un-serialized data safely ---
         try:
             payload = avro_deserializer(msg.value(), ctx)
         except Exception as serialization_error:
-            # Safely skip plain text legacy payloads that lack the Avro magic byte
-            print(f"[SKIPPING LEGACY RECORD] Found non-Avro or pre-migration payload: {serialization_error}")
+            print(f"[SKIPPING LEGACY RECORD] Found non-Avro payload: {serialization_error}")
             continue
-        # --- END OF UPDATED REGION ---
         
         if payload:
             ip = payload.get("ip_address")
             ep = payload.get("endpoint")
             ts = payload.get("timestamp")
-            
-            print(f"[DEBUG RECEIVED] Telemetry Event from IP: {ip} | Endpoint: {ep}")
             
             evaluate_velocity_rule(ip, ep, ts)
 
