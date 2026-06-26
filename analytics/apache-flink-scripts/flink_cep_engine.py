@@ -44,12 +44,11 @@ def main():
         f"{kafka_jar_path.as_uri()};{json_jar_path.as_uri()}"
     )
     
-    # Expanded State TTL to 24 hours to preserve CDC stream-stream join state
     config.set_string("table.exec.state.ttl", "24 h")
     config.set_string("table.exec.source.idle-timeout", "5000 ms")
 
     # =========================================================================
-    # 2. SOURCE TABLE DEFINITIONS (With True Debezium Business Time Alignment)
+    # 2. SOURCE TABLE DEFINITIONS
     # =========================================================================
     print("[Flink Init] Mapping CDC Relational Streams with Business Clocks...")
 
@@ -90,7 +89,7 @@ def main():
     """)
 
     # =========================================================================
-    # 3. DATA STREAM UNIFICATION (Fixed to prevent account state duplication)
+    # 3. DATA STREAM UNIFICATION 
     # =========================================================================
     print("[Flink Processing] Unifying disparate streams into Timeline View...")
     t_env.execute_sql("""
@@ -121,10 +120,9 @@ def main():
             CAST(t.amount AS DOUBLE) AS amount
         FROM src_transactions t 
         JOIN src_accounts a ON t.from_account = a.account_id 
-        WHERE (t.op = 'c' OR t.op = 'r') AND (a.op = 'c' OR a.op = 'r') -- <-- THE FIX
+        WHERE (t.op = 'c' OR t.op = 'r') AND (a.op = 'c' OR a.op = 'r')
     """)
 
-    # Re-declare the intermediate Kafka topic to lock in the Watermark/Rowtime
     print("[Flink Infrastructure] Setting up intermediate derived topic...")
     t_env.execute_sql(f"""
         CREATE TABLE kafka_unified_timeline (
@@ -144,31 +142,33 @@ def main():
     """)
 
     # =========================================================================
-    # 4. DEBUG SINK DEFINITIONS
+    # 4. SINK DEFINITIONS (NEW: Outputting directly to Risk Engine Topic)
     # =========================================================================
-    # Fraud Alerts Match Debugger Sink (Expects 5 Columns)
-    t_env.execute_sql("""
-        CREATE TEMPORARY TABLE debug_fraud_alerts (
+    # LIVE SINK: Pushes structured alerts to Kafka for Phase 6
+    t_env.execute_sql(f"""
+        CREATE TABLE kafka_fraud_alerts (
             customer_id STRING,
+            risk_indicator_type STRING,
             initial_failed_login TIMESTAMP_LTZ(3),
             beneficiary_added_time TIMESTAMP_LTZ(3),
             exfiltration_transfer_time TIMESTAMP_LTZ(3),
             stolen_funds DOUBLE
         ) WITH (
-            'connector' = 'print'
+            'connector' = 'kafka',
+            'topic' = 'fraud_alerts',
+            'properties.bootstrap.servers' = '{KAFKA_BROKER}',
+            'format' = 'json'
         )
     """)
 
-    # Raw Data Debugger Sink (To see everything entering the timeline)
+    # Debug Sink: To see raw unified timeline in the console
     t_env.execute_sql("""
         CREATE TEMPORARY TABLE debug_raw_stream (
             customer_id STRING,
             event_type STRING,
             event_time TIMESTAMP_LTZ(3),
             amount DOUBLE
-        ) WITH (
-            'connector' = 'print'
-        )
+        ) WITH ('connector' = 'print')
     """)
 
     # =========================================================================
@@ -187,10 +187,16 @@ def main():
         SELECT * FROM view_unified_timeline
     """)
 
-    # Task 2: Read from intermediate Kafka table, execute CEP, and sink to print
+    # Task 2: MATCH_RECOGNIZE query -> Sink to Phase 6 Kafka Topic
     stmt_set.add_insert_sql("""
-        INSERT INTO debug_fraud_alerts
-        SELECT *
+        INSERT INTO kafka_fraud_alerts
+        SELECT 
+            customer_id,
+            'CEP_ATO_MATCH' AS risk_indicator_type,
+            initial_failed_login,
+            beneficiary_added_time,
+            exfiltration_transfer_time,
+            stolen_funds
         FROM kafka_unified_timeline
         MATCH_RECOGNIZE (
             PARTITION BY customer_id
@@ -210,13 +216,12 @@ def main():
         )
     """)
 
-    # Task 3: Print all raw events entering the pattern matcher
+    # Task 3: Print all raw events entering the pattern matcher (Debugging)
     stmt_set.add_insert_sql("""
         INSERT INTO debug_raw_stream
         SELECT * FROM kafka_unified_timeline
     """)
 
-    # Wait for completion
     stmt_set.execute().wait()
 
 if __name__ == '__main__':
