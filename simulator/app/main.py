@@ -3,6 +3,7 @@ import random
 import sys
 import httpx
 from faker import Faker
+import os
 from app.actors.customer import AsyncCustomerActor, AsyncEmployeeActor
 from app.attacks.scenarios import ScenarioManager
 
@@ -64,7 +65,8 @@ async def main_engine():
     
     limits = httpx.Limits(max_keepalive_connections=300, max_connections=3000)
     
-    async with httpx.AsyncClient(base_url="http://127.0.0.1:8000", limits=limits, timeout=10.0) as client:
+    api_url = os.getenv("API_URL", os.getenv("BANKING_API_URL", "http://127.0.0.1:8000"))
+    async with httpx.AsyncClient(base_url=api_url, limits=limits, timeout=10.0) as client:
         
         customer_tasks = [
             asyncio.create_task(customer_lifecycle_loop(cust, client)) 

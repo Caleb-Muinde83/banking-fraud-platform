@@ -4,6 +4,7 @@ sqlalchemy
 psycopg2-binary
 pydantic
 pydantic-settings
+email-validator
 aiokafka
 asyncpg
 confluent-kafka[avro]

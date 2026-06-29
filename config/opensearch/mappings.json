@@ -1,0 +1,39 @@
+{
+  "api_requests": {
+    "mappings": {
+      "properties": {
+        "timestamp": { "type": "date" },
+        "request_id": { "type": "keyword" },
+        "ip_address": { "type": "ip" },
+        "user_agent": { "type": "keyword" },
+        "endpoint": { "type": "keyword" },
+        "method": { "type": "keyword" },
+        "status_code": { "type": "integer" }
+      }
+    }
+  },
+  "login_events": {
+    "mappings": {
+      "properties": {
+        "timestamp": { "type": "date" },
+        "customer_id": { "type": "keyword" },
+        "success": { "type": "boolean" },
+        "ip_address": { "type": "ip" },
+        "country": { "type": "keyword" },
+        "device_id": { "type": "keyword" }
+      }
+    }
+  },
+  "alerts": {
+    "mappings": {
+      "properties": {
+        "timestamp": { "type": "date" },
+        "alert_id": { "type": "keyword" },
+        "customer_id": { "type": "keyword" },
+        "cumulative_score": { "type": "integer" },
+        "contributing_indicators": { "type": "keyword" },
+        "action_required": { "type": "keyword" }
+      }
+    }
+  }
+}

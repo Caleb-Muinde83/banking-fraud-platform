@@ -21,7 +21,7 @@ services:
     ports:
       - "${POSTGRES_PORT}:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - F:/DaTech-kafka/banking-fraud-platform/persisted-volumes/postgres:/var/lib/postgresql/data
     restart: unless-stopped
 
 
@@ -93,7 +93,7 @@ services:
 
   # =========================
   # Kafka Connect Bootstrapper
-  # This service registers the Debezium connector after Connect is healthy.
+  # =========================
   connect-init:
     image: curlimages/curl:latest
     container_name: bank_connect_init
@@ -133,7 +133,7 @@ services:
     image: flink:1.18-scala_2.12-java11
     container_name: bank_flink_jobmanager
     ports:
-      - "8082:8081"   # Flink UI (avoids Schema Registry conflict)
+      - "8082:8081"
     command: jobmanager
     depends_on:
       - kafka
@@ -184,6 +184,7 @@ services:
         api_requests
         dead_letter_queue
         fraud_alerts
+        critical_alerts
         risk_scores
         enriched_transactions
         model_features
@@ -212,6 +213,44 @@ services:
         echo 'Bootstrap complete.'
     restart: "no"
 
+  # =========================================================================
+  # OpenSearch (Search, Analytics & Threat Hunting)
+  # =========================================================================
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: bank_opensearch
+    environment:
+      - cluster.name=bank-threat-hunting
+      - node.name=opensearch-node1
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m" 
+      - DISABLE_SECURITY_PLUGIN=true               
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - F:/DaTech-kafka/banking-fraud-platform/persisted-volumes/opensearch:/usr/share/opensearch/data
+    restart: unless-stopped
 
-volumes:
-  postgres_data:
+  # =========================================================================
+  # OpenSearch Dashboards (The Query/Visualization Web UI)
+  # =========================================================================
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.11.0
+    container_name: bank_opensearch_dashboards
+    ports:
+      - "5601:5601"
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_PLUGIN=true
+    depends_on:
+      - opensearch
+    restart: unless-stopped

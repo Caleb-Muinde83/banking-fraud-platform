@@ -32,6 +32,10 @@ simulator/venv/
 *.log
 logs/
 
+# Runtime service data
+persisted-volumes/
+**/persisted-volumes/
+
 # Packaging
 *.egg-info/
 dist/

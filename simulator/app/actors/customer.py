@@ -126,3 +126,20 @@ class AsyncEmployeeActor:
             await client.post("/api/employee/view-account", json={"customer_id": target_customer}, headers=rogue_headers)
         except httpx.RequestError:
             pass
+
+    async def perform_internal_action(self, client: httpx.AsyncClient, target_customer_ids):
+        """Compatibility entrypoint used by the simulator lifecycle loop."""
+        if target_customer_ids:
+            target_customer = random.choice(target_customer_ids)
+        else:
+            target_customer = f"cust_gen_{random.randint(0, 20)}"
+
+        headers = {
+            "X-Employee-Id": self.employee_id,
+            "X-Employee-Role": self.role,
+            "X-Employee-Department": self.department
+        }
+        try:
+            await client.post("/api/employee/view-account", json={"customer_id": target_customer}, headers=headers)
+        except httpx.RequestError:
+            pass
