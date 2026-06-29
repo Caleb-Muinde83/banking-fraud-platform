@@ -5,7 +5,7 @@ from collections import defaultdict
 from confluent_kafka import Consumer, Producer
 
 # Configuration
-KAFKA_BROKER = 'localhost:29092'
+KAFKA_BROKER = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:29092')
 ALERT_THRESHOLD = 80
 SCORE_DECAY_WINDOW_SEC = 3600  # Scores reset after 1 hour of inactivity
 

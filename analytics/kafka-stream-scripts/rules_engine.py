@@ -8,11 +8,18 @@ from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import StringDeserializer, SerializationContext, MessageField
 
 # 1. Infrastructure Setup
-schema_registry_client = SchemaRegistryClient({'url': 'http://localhost:8081'})
+schema_registry_client = SchemaRegistryClient({
+    'url': os.getenv('SCHEMA_REGISTRY_URL', 'http://localhost:8081')
+})
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT_DIR = os.path.dirname(CURRENT_DIR)
-SCHEMA_PATH = os.path.join(REPO_ROOT_DIR, "schemas", "api_request.avsc")
+REPO_ROOT_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
+SCHEMA_PATH = os.getenv(
+    "API_REQUEST_SCHEMA_PATH",
+    os.path.join(REPO_ROOT_DIR, "config", "schemas", "api_request.avsc")
+)
+if not os.path.exists(SCHEMA_PATH):
+    SCHEMA_PATH = os.path.join(REPO_ROOT_DIR, "schemas", "api_request.avsc")
 
 with open(SCHEMA_PATH, "r") as f:
     schema_str = f.read()
@@ -25,7 +32,7 @@ avro_deserializer = AvroDeserializer(
 string_deserializer = StringDeserializer('utf_8')
 
 # Set up both Consumer (Input) and Producer (Output to Risk Engine)
-KAFKA_BROKER = 'localhost:29092'
+KAFKA_BROKER = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:29092')
 consumer = Consumer({
     'bootstrap.servers': KAFKA_BROKER,
     'group.id': 'fraud-phase1-velocity-check-v2', 

@@ -7,11 +7,11 @@ from confluent_kafka.schema_registry.avro import AvroSerializer
 from confluent_kafka.serialization import StringSerializer, SerializationContext, MessageField  # <-- UPDATED IMPORTS
 
 # 1. Infrastructure Initialization
-schema_registry_conf = {'url': 'http://localhost:8081'}
+schema_registry_conf = {'url': os.getenv('SCHEMA_REGISTRY_URL', 'http://localhost:8081')}
 schema_registry_client = SchemaRegistryClient(schema_registry_conf)
 
 kafka_conf = {
-    'bootstrap.servers': 'localhost:29092',
+    'bootstrap.servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:29092'),
     'client.id': 'bank-telemetry-producer'
 }
 producer = Producer(kafka_conf)
@@ -19,7 +19,12 @@ producer = Producer(kafka_conf)
 # Dynamic Path Resolution
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_DIR)))
-SCHEMA_PATH = os.path.join(REPO_ROOT_DIR, "schemas", "api_request.avsc")
+SCHEMA_PATH = os.getenv(
+    "API_REQUEST_SCHEMA_PATH",
+    os.path.join(REPO_ROOT_DIR, "config", "schemas", "api_request.avsc")
+)
+if not os.path.exists(SCHEMA_PATH):
+    SCHEMA_PATH = os.path.join(REPO_ROOT_DIR, "schemas", "api_request.avsc")
 
 # 2. Load and Register Avro Schema safely
 with open(SCHEMA_PATH, "r") as f:

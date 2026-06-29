@@ -1,0 +1,172 @@
+version: "3.8"
+
+networks:
+  fraud_network:
+    driver: overlay
+    attachable: true
+    driver_opts:
+      com.docker.network.driver.mtu: "1200"
+
+services:
+  # NODE 1: k3s-master (100.68.40.33)
+  postgres:
+    image: debezium/postgres:15-alpine
+    environment:
+      POSTGRES_DB: bank_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-master
+
+  api:
+    image: banking-api:latest
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres_password@postgres:5432/bank_db
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    ports:
+      - "8000:8000"
+    networks:
+      - fraud_network
+    depends_on:
+      - postgres
+      - kafka
+      - schema-registry
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-master
+
+  simulator:
+    image: banking-simulator:latest
+    environment:
+      API_URL: http://api:8000
+      BANKING_API_URL: http://api:8000
+    networks:
+      - fraud_network
+    depends_on:
+      - api
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-master
+
+  kafka-connect:
+    image: debezium/connect:2.4
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: banking-connect-group
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    ports:
+      - "8083:8083"
+    networks:
+      - fraud_network
+    depends_on:
+      - kafka
+      - postgres
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-master
+
+  # NODE 2: k3s-worker-2 (100.120.104.76)
+  kafka:
+    image: ubuntu/kafka:3.4-22.04_beta
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://100.120.104.76:19092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "19092:19092"
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-2
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.4.0
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    ports:
+      - "8081:8081"
+    networks:
+      - fraud_network
+    depends_on:
+      - kafka
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-2
+
+  # NODE 3: k3s-worker-3 (100.109.78.25)
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    volumes:
+      - osdata:/usr/share/opensearch/data
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-3
+
+  flink-jobmanager:
+    image: flink:1.18-scala_2.12
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-3
+
+  flink-taskmanager:
+    image: flink:1.18-scala_2.12
+    command: taskmanager
+    environment:
+      JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+    networks:
+      - fraud_network
+    depends_on:
+      - flink-jobmanager
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-3
+
+volumes:
+  pgdata:
+  kafkadata:
+  osdata:

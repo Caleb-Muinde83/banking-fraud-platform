@@ -2,11 +2,12 @@ import httpx
 import random
 import asyncio
 import uuid
+import os
 from faker import Faker
 
 fake = Faker()
 # Base URL targeting absolute root domain to prevent path-stripping
-API_URL = "http://127.0.0.1:8000"
+API_URL = os.getenv("API_URL", os.getenv("BANKING_API_URL", "http://127.0.0.1:8000"))
 
 class ScenarioManager:
     

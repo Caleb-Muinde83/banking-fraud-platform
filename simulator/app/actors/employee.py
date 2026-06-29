@@ -1,7 +1,8 @@
 import requests
 import random
+import os
 
-API_URL = "http://127.0.0.1:8000/api"
+API_URL = os.getenv("API_URL", os.getenv("BANKING_API_URL", "http://127.0.0.1:8000")).rstrip("/") + "/api"
 
 class EmployeeActor:
     def __init__(self, employee_id, department, role):

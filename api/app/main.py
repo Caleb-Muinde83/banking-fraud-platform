@@ -144,18 +144,26 @@ async def startup_pipeline_provisioning():
                     {"id": "VIP-CFO-ACCOUNT-002", "first": "Executive", "last": "CFO"}
                 ]
                 for vip in vips:
-                    new_vip = models.Customer(
-                        customer_id=vip["id"], first_name=vip["first"], last_name=vip["last"],
-                        email=f"{vip['first'].lower()}@enterprise-vault.com", country="US", risk_level="HIGH"
-                    )
-                    db.add(new_vip)
-                    await db.flush()
+                    # ---> FIX: Use 'last' name to ensure unique emails for the CEO and CFO
+                    vip_email = f"{vip['last'].lower()}@enterprise-vault.com"
                     
-                    new_vip_acc = models.Account(
-                        account_id=vip["id"].replace("ACCOUNT", "ACC"), customer_id=vip["id"],
-                        balance=2500000.00, currency="USD", status="ACTIVE"
+                    # ---> OPTION 2 FIX: Check before inserting to handle persisted volumes gracefully
+                    existing_vip = await db.execute(
+                        select(models.Customer).where(models.Customer.customer_id == vip["id"])
                     )
-                    db.add(new_vip_acc)
+                    if not existing_vip.scalar_one_or_none():
+                        new_vip = models.Customer(
+                            customer_id=vip["id"], first_name=vip["first"], last_name=vip["last"],
+                            email=vip_email, country="US", risk_level="HIGH"
+                        )
+                        db.add(new_vip)
+                        await db.flush()
+                        
+                        new_vip_acc = models.Account(
+                            account_id=vip["id"].replace("ACCOUNT", "ACC"), customer_id=vip["id"],
+                            balance=2500000.00, currency="USD", status="ACTIVE"
+                        )
+                        db.add(new_vip_acc)
 
             await db.commit()
             print("[Startup] Seeding routine completed cleanly.")

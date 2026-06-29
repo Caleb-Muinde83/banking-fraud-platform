@@ -95,7 +95,7 @@ def run_flink_risk_engine():
 
     # Define Kafka Source (Ingests from Phase 1 output)
     kafka_source = KafkaSource.builder() \
-        .set_bootstrap_servers("127.0.0.1:9092") \
+        .set_bootstrap_servers(os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092")) \
         .set_topics("fraud_alerts") \
         .set_group_id("flink-risk-group") \
         .set_value_only_deserializer(Types.STRING()) \
@@ -103,7 +103,7 @@ def run_flink_risk_engine():
 
     # Define Kafka Sink (Outputs Critical Alerts)
     kafka_sink = KafkaSink.builder() \
-        .set_bootstrap_servers("127.0.0.1:9092") \
+        .set_bootstrap_servers(os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092")) \
         .set_record_serializer(
             KafkaRecordSerializationSchema.builder()
                 .set_topic("critical_alerts")
