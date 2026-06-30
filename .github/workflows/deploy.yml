@@ -4,30 +4,36 @@ on:
   push:
     branches:
       - main
-    paths:
-      - "**"
 
 jobs:
   deploy:
-    runs-on: self-hosted
+    runs-on: self-hosted  # Executes directly on your k3s-master laptop via Tailscale
     steps:
       - name: Checkout Codebase
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
+      # Paths are now relative to the repository root
       - name: Build Banking API Local Image
-        run: docker build -f api/Dockerfile -t banking-api:latest .
+        run: |
+          cd api
+          docker build -t banking-api:latest .
 
       - name: Build Threat Simulator Local Image
-        run: docker build -f simulator/Dockerfile -t banking-simulator:latest .
+        run: |
+          cd simulator
+          docker build -t banking-simulator:latest .
 
       - name: Deploy Orchestration Stack to Swarm
-        run: docker stack deploy -c infra/docker-compose.yml fraud_platform
+        run: |
+          cd infra
+          docker stack deploy -c docker-compose.yml fraud_platform
 
       - name: Cool Down for Service Standup
         run: sleep 40
 
       - name: Establish Debezium Engine Event Source
         run: |
+          cd config/kafka-connect
           curl -X POST -H "Content-Type: application/json" \
-            --data @config/kafka-connect/postgres-source.json \
+            --data @postgres-source.json \
             http://localhost:8083/connectors || echo "Connector configuration already active"

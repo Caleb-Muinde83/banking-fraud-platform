@@ -6,13 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-COPY api/requirements.txt /app/requirements.txt
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY api/app /app/app
-COPY api/seed_db.py /app/seed_db.py
+COPY app /app/app
+COPY seed_db.py /app/seed_db.py
 COPY config /app/config
-COPY schemas /app/schemas
 
 EXPOSE 8000
 
