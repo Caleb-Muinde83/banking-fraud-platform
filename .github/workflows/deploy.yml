@@ -6,7 +6,7 @@ on:
       - main
     paths:
       - "banking-fraud-platform/**"
-      - ".github/workflows/deploy-banking-fraud-platform.yml"
+      - ".github/workflows/deploy.yml" # ✅ Match the actual file name
 
 jobs:
   deploy:
