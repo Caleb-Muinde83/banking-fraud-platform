@@ -276,3 +276,386 @@ This repository is owned by `Caleb-Muinde83` and may be maintained by the Datech
 - `LICENSE` establishes the project as open source.
 - `CONTRIBUTING.md` explains how the community can propose changes and submit pull requests.
 - Maintainers and collaborators should be granted admin/write access to review and merge PRs.
+
+************************************************************
+*****************************************************************
+**Documentation Summary**
+
+I updated `banking-fraud-platform` from a mostly local single-node Compose project toward a deployable Docker Swarm/Tailscale homelab layout, while preserving the existing source tree and avoiding destructive cleanup.
+
+The main goal was to implement the structure from your deployment plan inside the real project folder, not in a separate `12-real-world-projects/...` path.
+
+**New Deployment Structure**
+
+Added these folders and files:
+
+```text
+banking-fraud-platform/
+├── .github/
+│   └── workflows/
+│       └── deploy.yml
+├── infra/
+│   └── docker-compose.yml
+├── config/
+│   ├── kafka-connect/
+│   │   └── postgres-source.json
+│   ├── opensearch/
+│   │   └── mappings.json
+│   └── schemas/
+│       └── api_request.avsc
+```
+
+Also added a repository-root workflow:
+
+```text
+.github/
+└── workflows/
+    └── deploy-banking-fraud-platform.yml
+```
+
+This root workflow matters because the actual Git repository root is:
+
+```text
+F:\DaTech-kafka
+```
+
+not:
+
+```text
+F:\DaTech-kafka\banking-fraud-platform
+```
+
+GitHub Actions only detects workflows under the Git root `.github/workflows/`.
+
+**Swarm Stack Added**
+
+Created:
+
+```text
+banking-fraud-platform/infra/docker-compose.yml
+```
+
+This defines the distributed Docker Swarm deployment across your Tailscale nodes:
+
+```text
+k3s-master
+- PostgreSQL
+- Banking API
+- Simulator
+- Kafka Connect
+
+k3s-worker-2
+- Kafka
+- Schema Registry
+
+k3s-worker-3
+- OpenSearch
+- Flink JobManager
+- Flink TaskManager
+```
+
+The stack uses an overlay network:
+
+```yaml
+fraud_network:
+  driver: overlay
+  attachable: true
+```
+
+and Swarm placement constraints such as:
+
+```yaml
+deploy:
+  placement:
+    constraints:
+      - node.hostname == k3s-master
+```
+
+**Debezium CDC Config Added**
+
+Created:
+
+```text
+banking-fraud-platform/config/kafka-connect/postgres-source.json
+```
+
+This config registers a Debezium PostgreSQL connector for the core banking tables:
+
+```text
+login_events
+sessions
+accounts
+transactions
+beneficiaries
+employee_actions
+```
+
+It emits events under the Kafka topic prefix:
+
+```text
+banking
+```
+
+Example output topics:
+
+```text
+banking.login_events
+banking.transactions
+banking.accounts
+```
+
+**OpenSearch Mapping Config Added**
+
+Created:
+
+```text
+banking-fraud-platform/config/opensearch/mappings.json
+```
+
+This documents intended mappings for:
+
+```text
+api_requests
+login_events
+alerts
+```
+
+The mappings define fields like timestamps, customer IDs, IP addresses, endpoints, status codes, alert IDs, and risk scores.
+
+**Schema Organization Updated**
+
+Copied:
+
+```text
+banking-fraud-platform/schemas/api_request.avsc
+```
+
+to:
+
+```text
+banking-fraud-platform/config/schemas/api_request.avsc
+```
+
+The original file was left in place for backward compatibility with existing local scripts.
+
+Code was updated to prefer the new path:
+
+```text
+config/schemas/api_request.avsc
+```
+
+and fall back to the old path:
+
+```text
+schemas/api_request.avsc
+```
+
+**GitHub Actions Added**
+
+Added project-local workflow:
+
+```text
+banking-fraud-platform/.github/workflows/deploy.yml
+```
+
+Added actual repo-root workflow:
+
+```text
+.github/workflows/deploy-banking-fraud-platform.yml
+```
+
+The repo-root workflow:
+
+1. Runs on your self-hosted runner.
+2. Builds the API image:
+
+```bash
+docker build -f api/Dockerfile -t banking-api:latest .
+```
+
+3. Builds the simulator image:
+
+```bash
+docker build -f simulator/Dockerfile -t banking-simulator:latest .
+```
+
+4. Deploys the Swarm stack:
+
+```bash
+docker stack deploy -c infra/docker-compose.yml fraud_platform
+```
+
+5. Waits for services to come up.
+6. Registers the Debezium connector through Kafka Connect.
+
+**Dockerfiles Completed**
+
+The API and simulator Dockerfiles were previously empty.
+
+Updated:
+
+```text
+banking-fraud-platform/api/Dockerfile
+banking-fraud-platform/simulator/Dockerfile
+```
+
+The API Dockerfile now:
+
+- Uses `python:3.12-slim`
+- Installs `api/requirements.txt`
+- Copies `api/app`
+- Copies `api/seed_db.py`
+- Copies `config`
+- Copies `schemas`
+- Starts FastAPI with Uvicorn on port `8000`
+
+The simulator Dockerfile now:
+
+- Uses `python:3.12-slim`
+- Installs simulator requirements
+- Copies simulator source
+- Runs the simulator main engine
+
+**Runtime Configuration Improvements**
+
+Updated several files so services work both locally and inside Swarm.
+
+Environment-variable support was added for:
+
+```text
+KAFKA_BOOTSTRAP_SERVERS
+SCHEMA_REGISTRY_URL
+API_REQUEST_SCHEMA_PATH
+OPENSEARCH_HOST
+OPENSEARCH_PORT
+OPENSEARCH_USER
+OPENSEARCH_PASSWORD
+API_URL
+BANKING_API_URL
+```
+
+Files updated include:
+
+```text
+api/app/middleware/kafka_producer.py
+analytics/kafka-stream-scripts/rules_engine.py
+analytics/kafka-stream-scripts/risk_scoring_engine.py
+analytics/opensearch/opensearch_sink.py
+analytics/apache-flink-scripts/flink_risk_engine.py
+simulator/app/main.py
+simulator/app/attacks/scenarios.py
+simulator/app/actors/employee.py
+```
+
+This replaces hardcoded local assumptions like:
+
+```text
+localhost:29092
+localhost:8081
+127.0.0.1:8000
+localhost:9200
+```
+
+with environment-aware defaults.
+
+**Simulator Fix**
+
+Fixed a method mismatch in:
+
+```text
+simulator/app/actors/customer.py
+```
+
+The simulator loop was calling:
+
+```python
+perform_internal_action(...)
+```
+
+on `AsyncEmployeeActor`, but the class only had:
+
+```python
+perform_action(...)
+```
+
+I added `perform_internal_action(...)` so employee simulation loops can run correctly.
+
+**Dependency Fix**
+
+Updated:
+
+```text
+api/requirements.txt
+```
+
+Added:
+
+```text
+email-validator
+```
+
+because your Pydantic schemas import `EmailStr`, which requires `email-validator` at runtime.
+
+**Git Ignore Update**
+
+Updated:
+
+```text
+banking-fraud-platform/.gitignore
+```
+
+Added:
+
+```gitignore
+persisted-volumes/
+**/persisted-volumes/
+```
+
+This prevents Postgres and OpenSearch runtime data from being committed.
+
+I did not delete:
+
+```text
+backend/
+api/venv/
+simulator/venv/
+persisted-volumes/
+```
+
+I only made sure generated/runtime folders are ignored going forward.
+
+**Validation Performed**
+
+I ran Python syntax checks on the changed Python files:
+
+```bash
+python -m py_compile ...
+```
+
+Result: passed.
+
+I also validated the new Swarm compose file:
+
+```bash
+docker compose -f banking-fraud-platform\infra\docker-compose.yml config
+```
+
+Result: passed.
+
+Docker Compose gave a warning that `version: "3.8"` is obsolete in newer Compose, but the file still renders correctly. It was kept because Swarm stack examples commonly use that format.
+
+**Suggested Commit Message**
+
+```text
+feat: add Tailscale Swarm deployment for banking fraud platform
+
+- Add distributed Docker Swarm stack under infra/docker-compose.yml
+- Add GitHub Actions deployment workflow for self-hosted runner
+- Add Debezium PostgreSQL CDC connector config
+- Add OpenSearch index mappings and relocated Avro schema config
+- Complete API and simulator Dockerfiles for local image builds
+- Make Kafka, Schema Registry, OpenSearch, and API URLs env-configurable
+- Fix simulator employee actor lifecycle method mismatch
+- Add email-validator dependency required by Pydantic EmailStr
+- Ignore persisted runtime volumes to keep service data out of Git
+```
