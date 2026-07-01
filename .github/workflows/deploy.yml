@@ -6,15 +6,11 @@ on:
       - main
     paths:
       - "banking-fraud-platform/**"
-      - ".github/workflows/deploy.yml" # ✅ Match the actual file name
+      - ".github/workflows/deploy.yml"
 
 jobs:
   deploy:
     runs-on: self-hosted
-
-    defaults:
-      run:
-        working-directory: banking-fraud-platform
 
     steps:
       - name: Checkout Codebase
@@ -36,7 +32,7 @@ jobs:
           # Poll Kafka Connect every 10 seconds for up to 3 minutes
           for i in {1..18}; do
             if curl -s -f http://localhost:8083/connectors > /dev/null; then
-              echo "✅ ✅Kafka Connect is UP and ready!"
+              echo "✅ Kafka Connect is UP and ready!"
               break
             fi
 
