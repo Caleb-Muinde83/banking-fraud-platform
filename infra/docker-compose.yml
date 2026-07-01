@@ -106,22 +106,7 @@ services:
         done
 
         echo 'Provisioning Platform Topics...'
-        topics="
-        api_requests
-        dead_letter_queue
-        fraud_alerts
-        critical_alerts
-        risk_scores
-        enriched_transactions
-        model_features
-        banking.login_events
-        banking.sessions
-        banking.accounts
-        banking.transactions
-        banking.beneficiaries
-        banking.employee_actions
-        banking.unified_timeline
-        "
+        topics="api_requests dead_letter_queue fraud_alerts critical_alerts risk_scores enriched_transactions model_features banking.login_events banking.sessions banking.accounts banking.transactions banking.beneficiaries banking.employee_actions banking.unified_timeline"
 
         for topic in $$topics; do
           kafka-topics \
@@ -136,39 +121,6 @@ services:
         echo 'Verifying topics...'
         kafka-topics --bootstrap-server kafka:9092 --list
         echo 'Bootstrap complete.'
-    deploy:
-      placement:
-        constraints:
-          - node.hostname == k3s-master
-      restart_policy:
-        condition: none
-
-  connect-init:
-    image: curlimages/curl:latest
-    networks:
-      - fraud_network
-    volumes:
-      - ./debezium-postgres-connector.json:/tmp/debezium-postgres-connector.json:ro
-    entrypoint: /bin/sh
-    command:
-      - -c
-      - |
-        echo 'Waiting for Kafka Connect availability...'
-        until curl -fs http://kafka-connect:8083/connectors >/dev/null 2>&1; do
-          sleep 5
-        done
-
-        echo 'Registering Debezium connector if missing...'
-        if curl -s -o /dev/null -w '%{http_code}' http://kafka-connect:8083/connectors/banking-cdc-connector | grep -q '^200$$'; then
-          echo 'Connector already registered.'
-          exit 0
-        fi
-
-        curl -s -X POST \
-          -H 'Content-Type: application/json' \
-          --data @/tmp/debezium-postgres-connector.json \
-          http://kafka-connect:8083/connectors
-        echo 'Connector registration complete.'
     deploy:
       placement:
         constraints:
@@ -199,7 +151,7 @@ services:
     ports:
       - "19092:19092"
     volumes:
-      - kafkadata:/var/lib/kafka/data
+      - kafkadata_kraft:/var/lib/kafka/data
     networks:
       - fraud_network
     deploy:
@@ -300,5 +252,5 @@ services:
 
 volumes:
   pgdata:
-  kafkadata:
+  kafkadata_kraft:
   osdata:
