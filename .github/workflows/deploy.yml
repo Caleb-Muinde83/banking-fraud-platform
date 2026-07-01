@@ -4,36 +4,60 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "banking-fraud-platform/**"
+      - ".github/workflows/deploy-banking-fraud-platform.yml"
 
 jobs:
   deploy:
-    runs-on: self-hosted  # Executes directly on your k3s-master laptop via Tailscale
+    runs-on: self-hosted
+
+    defaults:
+      run:
+        working-directory: banking-fraud-platform
+
     steps:
       - name: Checkout Codebase
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      # Paths are now relative to the repository root
       - name: Build Banking API Local Image
-        run: |
-          cd api
-          docker build -t banking-api:latest .
+        run: docker build -f api/Dockerfile -t banking-api:latest .
 
       - name: Build Threat Simulator Local Image
-        run: |
-          cd simulator
-          docker build -t banking-simulator:latest .
+        run: docker build -f simulator/Dockerfile -t banking-simulator:latest .
 
       - name: Deploy Orchestration Stack to Swarm
-        run: |
-          cd infra
-          docker stack deploy -c docker-compose.yml fraud_platform
+        run: docker stack deploy -c infra/docker-compose.yml fraud_platform
 
-      - name: Cool Down for Service Standup
-        run: sleep 40
+      - name: Wait for Kafka Connect Initialization
+        run: |
+          echo "Waiting for Kafka Connect REST API to be fully ready..."
+
+          # Poll Kafka Connect every 10 seconds for up to 3 minutes
+          for i in {1..18}; do
+            if curl -s -f http://localhost:8083/connectors > /dev/null; then
+              echo "✅ Kafka Connect is UP and ready!"
+              break
+            fi
+
+            echo "Waiting for Kafka Connect... (attempt $i/18)"
+            sleep 10
+          done
+
+          # Fail the workflow if Kafka Connect never became available
+          if ! curl -s -f http://localhost:8083/connectors > /dev/null; then
+            echo "❌ Kafka Connect failed to become ready within 3 minutes."
+            exit 1
+          fi
 
       - name: Establish Debezium Engine Event Source
         run: |
-          cd config/kafka-connect
-          curl -X POST -H "Content-Type: application/json" \
-            --data @postgres-source.json \
-            http://localhost:8083/connectors || echo "Connector configuration already active"
+          echo "Submitting Postgres CDC connector configuration..."
+
+          curl -sS \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --max-time 15 \
+            --data @config/kafka-connect/postgres-source.json \
+            http://localhost:8083/connectors \
+            || echo "Connector configuration already active or failed"

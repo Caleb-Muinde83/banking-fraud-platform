@@ -8,13 +8,26 @@ networks:
       com.docker.network.driver.mtu: "1200"
 
 services:
+  # =========================================================================
   # NODE 1: k3s-master (100.68.40.33)
+  # =========================================================================
+  
   postgres:
     image: debezium/postgres:15-alpine
+    command:
+      - postgres
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=4"
+      - "-c"
+      - "max_wal_senders=4"
     environment:
       POSTGRES_DB: bank_db
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres_password
+    ports:
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:
@@ -23,6 +36,8 @@ services:
       placement:
         constraints:
           - node.hostname == k3s-master
+      restart_policy:
+        condition: on-failure
 
   api:
     image: banking-api:latest
@@ -38,6 +53,8 @@ services:
       placement:
         constraints:
           - node.hostname == k3s-master
+      restart_policy:
+        condition: on-failure
 
   simulator:
     image: banking-simulator:latest
@@ -50,6 +67,8 @@ services:
       placement:
         constraints:
           - node.hostname == k3s-master
+      restart_policy:
+        condition: on-failure
 
   kafka-connect:
     image: debezium/connect:2.4
@@ -70,29 +89,77 @@ services:
       placement:
         constraints:
           - node.hostname == k3s-master
+      restart_policy:
+        condition: on-failure
 
+  kafka-init:
+    image: confluentinc/cp-kafka:7.4.0
+    networks:
+      - fraud_network
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo 'Waiting for Kafka broker availability...'
+        until kafka-topics --bootstrap-server kafka:9092 --list >/dev/null 2>&1; do
+          sleep 5
+        done
+
+        echo 'Provisioning Platform Topics...'
+        topics="api_requests dead_letter_queue fraud_alerts critical_alerts risk_scores enriched_transactions model_features banking.login_events banking.sessions banking.accounts banking.transactions banking.beneficiaries banking.employee_actions banking.unified_timeline"
+
+        for topic in $$topics; do
+          kafka-topics \
+            --bootstrap-server kafka:9092 \
+            --create \
+            --if-not-exists \
+            --topic $$topic \
+            --partitions 3 \
+            --replication-factor 1
+        done
+
+        echo 'Verifying topics...'
+        kafka-topics --bootstrap-server kafka:9092 --list
+        echo 'Bootstrap complete.'
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-master
+      restart_policy:
+        condition: none
+
+  # =========================================================================
   # NODE 2: k3s-worker-2 (100.120.104.76)
+  # =========================================================================
+  
   kafka:
-    image: ubuntu/kafka:3.4-22.04_beta
+    image: confluentinc/cp-kafka:7.4.0
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://100.120.104.76:19092
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
     ports:
       - "19092:19092"
     volumes:
-      - kafkadata:/var/lib/kafka/data
+      - kafkadata_kraft:/var/lib/kafka/data
     networks:
       - fraud_network
     deploy:
       placement:
         constraints:
           - node.hostname == k3s-worker-2
+      restart_policy:
+        condition: on-failure
 
   schema-registry:
     image: confluentinc/cp-schema-registry:7.4.0
@@ -108,14 +175,22 @@ services:
       placement:
         constraints:
           - node.hostname == k3s-worker-2
+      restart_policy:
+        condition: on-failure
 
+  # =========================================================================
   # NODE 3: k3s-worker-3 (100.109.78.25)
+  # =========================================================================
+  
   opensearch:
     image: opensearchproject/opensearch:2.11.0
     environment:
-      discovery.type: single-node
-      plugins.security.disabled: "true"
-      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+      - cluster.name=bank-threat-hunting
+      - node.name=opensearch-node1
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - DISABLE_SECURITY_PLUGIN=true
     ports:
       - "9200:9200"
     volumes:
@@ -126,6 +201,24 @@ services:
       placement:
         constraints:
           - node.hostname == k3s-worker-3
+      restart_policy:
+        condition: on-failure
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.11.0
+    ports:
+      - "5601:5601"
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_PLUGIN=true
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-3
+      restart_policy:
+        condition: on-failure
 
   flink-jobmanager:
     image: flink:1.18-scala_2.12
@@ -140,6 +233,8 @@ services:
       placement:
         constraints:
           - node.hostname == k3s-worker-3
+      restart_policy:
+        condition: on-failure
 
   flink-taskmanager:
     image: flink:1.18-scala_2.12
@@ -152,8 +247,10 @@ services:
       placement:
         constraints:
           - node.hostname == k3s-worker-3
+      restart_policy:
+        condition: on-failure
 
 volumes:
   pgdata:
-  kafkadata:
+  kafkadata_kraft:
   osdata:
