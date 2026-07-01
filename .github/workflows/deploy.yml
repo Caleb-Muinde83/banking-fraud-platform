@@ -17,10 +17,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build Banking API Local Image
-        run: docker build -f api/Dockerfile -t banking-api:latest .
+        # Notice we changed '.' to './api' 
+        run: docker build -t banking-api:latest ./api
 
       - name: Build Threat Simulator Local Image
-        run: docker build -f simulator/Dockerfile -t banking-simulator:latest .
+        # Notice we changed '.' to './simulator'
+        run: docker build -t banking-simulator:latest ./simulator
 
       - name: Deploy Orchestration Stack to Swarm
         run: docker stack deploy -c infra/docker-compose.yml fraud_platform
