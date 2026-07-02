@@ -51,6 +51,19 @@ AsyncSessionLocal = async_sessionmaker(
     expire_on_commit=False
 )
 
+
+def build_provisional_customer(customer_id: str, country: Optional[str] = "US", risk_level: str = "LOW") -> models.Customer:
+    """Create a customer record that satisfies the non-null schema requirements for fallback flows."""
+    return models.Customer(
+        customer_id=customer_id,
+        first_name="Auto",
+        last_name="Provisioned",
+        email=f"{customer_id}@auto-generated.io",
+        risk_level=risk_level,
+        country=country or "US",
+    )
+
+
 async def get_db():
     """Dependency injection yield loop providing async session execution."""
     async with AsyncSessionLocal() as session:
@@ -219,7 +232,7 @@ async def api_login(payload: LoginPayload, db: AsyncSession = Depends(get_db)):
     
     # Auto-provision customer profile context metrics dynamically if non-existent
     if not customer:
-        customer = models.Customer(customer_id=payload.username, risk_level="LOW", country=payload.country)
+        customer = build_provisional_customer(payload.username, payload.country, "LOW")
         db.add(customer)
         await db.flush()
         
@@ -279,7 +292,7 @@ async def get_account_balance(id: str, db: AsyncSession = Depends(get_db)):
         # Prevent FK failures by ensuring parent customer exists before the account
         cust_check = await db.execute(select(models.Customer).where(models.Customer.customer_id == "cust_unknown_fallback"))
         if not cust_check.scalar_one_or_none():
-            db.add(models.Customer(customer_id="cust_unknown_fallback", risk_level="LOW", country="US"))
+            db.add(build_provisional_customer("cust_unknown_fallback", "US", "LOW"))
             await db.flush()
 
         account = models.Account(account_id=id, customer_id="cust_unknown_fallback", balance=5000.00, status="ACTIVE")
@@ -298,7 +311,7 @@ async def execute_transfer(payload: TransferPayload, x_user_id: Optional[str] = 
             # ---> CRITICAL FIX: Ensure dynamic customer parent exists BEFORE account creation <---
             cust_check = await db.execute(select(models.Customer).where(models.Customer.customer_id == fallback_cust))
             if not cust_check.scalar_one_or_none():
-                db.add(models.Customer(customer_id=fallback_cust, risk_level="HIGH", country="UNKNOWN"))
+                db.add(build_provisional_customer(fallback_cust, "UNKNOWN", "HIGH"))
                 await db.flush()
 
             new_acc = models.Account(account_id=acc_id, customer_id=fallback_cust, balance=15000.00, status="ACTIVE")
@@ -335,7 +348,7 @@ async def add_beneficiary(payload: BeneficiaryPayload, x_user_id: Optional[str] 
     req_user = x_user_id or "UNKNOWN"
     cust_check = await db.execute(select(models.Customer).where(models.Customer.customer_id == req_user))
     if not cust_check.scalar_one_or_none():
-        db.add(models.Customer(customer_id=req_user, risk_level="LOW", country="UNKNOWN"))
+        db.add(build_provisional_customer(req_user, "UNKNOWN", "LOW"))
         await db.flush()
 
     beneficiary = models.Beneficiary(
