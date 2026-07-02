@@ -47,15 +47,3 @@ jobs:
             echo "❌❌❌ Kafka Connect failed to become ready within 3 minutes."
             exit 1
           fi
-
-      - name: Establish Debezium Engine Event Source
-        run: |
-          echo "Submitting Postgres CDC connector configuration..."
-
-          curl -sS \
-            -X POST \
-            -H "Content-Type: application/json" \
-            --max-time 15 \
-            --data @config/kafka-connect/postgres-source.json \
-            http://127.0.0.1:8083/connectors \
-            || echo "Connector configuration already active or failed"
