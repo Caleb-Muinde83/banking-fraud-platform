@@ -5,8 +5,14 @@ on:
     branches:
       - main
     paths:
-      - "banking-fraud-platform/**"
+      - "api/**"
+      - "backend/**"
+      - "simulator/**"
+      - "config/**"
+      - "infra/**"
+      - "docker-compose.yml"
       - ".github/workflows/deploy.yml"
+  workflow_dispatch:
 
 jobs:
   deploy:
