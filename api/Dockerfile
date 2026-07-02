@@ -11,7 +11,8 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app /app/app
 COPY seed_db.py /app/seed_db.py
-COPY config /app/config
+# This line is what pulls the schemas in during the Docker build
+COPY config /app/config 
 
 EXPOSE 8000
 

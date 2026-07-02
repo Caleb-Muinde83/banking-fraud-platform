@@ -15,6 +15,11 @@
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
     "key.converter.schemas.enable": "false",
-    "value.converter.schemas.enable": "false"
+    "value.converter.schemas.enable": "false",
+
+    "transforms": "RouteTable",
+    "transforms.RouteTable.type": "org.apache.kafka.connect.transforms.RegexRouter",
+    "transforms.RouteTable.regex": "banking\\.public\\.(.*)",
+    "transforms.RouteTable.replacement": "banking.$1"
   }
 }
