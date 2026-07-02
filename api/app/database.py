@@ -2,8 +2,11 @@ import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
 
-# Configure your real PostgreSQL connection parameters here
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/fraud_db")
+# Configure the same PostgreSQL connection parameters used by the local Docker stack and .env file
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://postgres_admin:SecureBankPassword2026!@localhost:5433/banking_db"
+)
 
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 

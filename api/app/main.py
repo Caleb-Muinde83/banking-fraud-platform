@@ -39,9 +39,9 @@ if raw_database_url and raw_database_url.startswith("postgresql://") and "+async
     raw_database_url = raw_database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 DATABASE_URL = raw_database_url or (
-    f"postgresql+asyncpg://{os.getenv('POSTGRES_USER', 'postgres')}:{os.getenv('POSTGRES_PASSWORD', 'postgres')}@"
+    f"postgresql+asyncpg://{os.getenv('POSTGRES_USER', 'postgres_admin')}:{os.getenv('POSTGRES_PASSWORD', 'SecureBankPassword2026!')}@"
     f"{os.getenv('POSTGRES_HOST', 'localhost')}:{os.getenv('POSTGRES_PORT', '5433')}/"
-    f"{os.getenv('POSTGRES_DB', 'fraud_db')}"
+    f"{os.getenv('POSTGRES_DB', 'banking_db')}"
 )
 
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)

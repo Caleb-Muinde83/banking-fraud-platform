@@ -23,9 +23,9 @@ services:
       - "-c"
       - "max_wal_senders=4"
     environment:
-      POSTGRES_DB: bank_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres_password
+      POSTGRES_DB: banking_db
+      POSTGRES_USER: postgres_admin
+      POSTGRES_PASSWORD: SecureBankPassword2026!
     ports:
       - "5432:5432"
     volumes:
@@ -42,7 +42,7 @@ services:
   api:
     image: banking-api:latest
     environment:
-      DATABASE_URL: postgresql://postgres:postgres_password@postgres:5432/bank_db
+      DATABASE_URL: postgresql://postgres_admin:SecureBankPassword2026!@postgres:5432/banking_db
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
     ports:
