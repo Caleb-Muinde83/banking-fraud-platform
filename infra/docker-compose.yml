@@ -14,9 +14,10 @@ services:
   
   postgres:
     image: debezium/postgres:15-alpine
-    command:
+    entrypoint:
       - /bin/bash
       - /docker-entrypoint-initdb.d/postgres-init.sh
+    command:
       - postgres
       - "-c"
       - "wal_level=logical"
