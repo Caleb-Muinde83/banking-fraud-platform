@@ -15,6 +15,8 @@ services:
   postgres:
     image: debezium/postgres:15-alpine
     command:
+      - /bin/bash
+      - /docker-entrypoint-initdb.d/postgres-init.sh
       - postgres
       - "-c"
       - "wal_level=logical"
@@ -30,6 +32,7 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./postgres-init.sh:/docker-entrypoint-initdb.d/postgres-init.sh:ro
     networks:
       - fraud_network
     deploy:
