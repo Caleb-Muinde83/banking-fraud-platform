@@ -65,11 +65,7 @@ jobs:
 
           if [ "$STATUS_CODE" -eq 200 ]; then
             echo "Connector already registered — updating config..."
-            python - <<'PY' > /tmp/connector-config.json
-import json
-cfg = json.load(open('config/kafka-connect/postgres-source.json'))['config']
-print(json.dumps(cfg))
-PY
+            python -c "import json,sys; print(json.dumps(json.load(open('config/kafka-connect/postgres-source.json'))['config']))" > /tmp/connector-config.json
 
             curl -s -X PUT -H 'Content-Type: application/json' \
               --data @/tmp/connector-config.json \
