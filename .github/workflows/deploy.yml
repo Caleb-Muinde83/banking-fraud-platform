@@ -65,7 +65,12 @@ jobs:
 
           if [ "$STATUS_CODE" -eq 200 ]; then
             echo "Connector already registered — updating config..."
-            python -c "import json,sys; print(json.dumps(json.load(open('config/kafka-connect/postgres-source.json'))['config']))" > /tmp/connector-config.json
+            if command -v jq >/dev/null 2>&1; then
+              jq '.config' config/kafka-connect/postgres-source.json > /tmp/connector-config.json
+            else
+              echo "jq not found; extracting config using python in a docker container"
+              docker run --rm -v "$PWD":/work -w /work python:3.11-slim python -c "import json,sys; print(json.dumps(json.load(open('config/kafka-connect/postgres-source.json'))['config']))" > /tmp/connector-config.json
+            fi
 
             curl -s -X PUT -H 'Content-Type: application/json' \
               --data @/tmp/connector-config.json \
