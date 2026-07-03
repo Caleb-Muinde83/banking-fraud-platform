@@ -30,6 +30,9 @@ jobs:
         # Notice we changed '.' to './simulator'
         run: docker build -t banking-simulator:latest ./simulator
 
+      - name: Build Postgres DB Image
+        run: docker build -f infra/postgres.Dockerfile -t banking-postgres:latest infra/
+
       - name: Deploy Orchestration Stack to Swarm
         run: docker stack deploy -c infra/docker-compose.yml fraud_platform
 
@@ -53,3 +56,29 @@ jobs:
             echo "❌❌❌ Kafka Connect failed to become ready within 3 minutes."
             exit 1
           fi
+
+      - name: Register Postgres CDC Connector
+        run: |
+          echo "Registering Debezium connector from config/kafka-connect/postgres-source.json..."
+
+          STATUS_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8083/connectors/postgres-banking-cdc)
+
+          if [ "$STATUS_CODE" -eq 200 ]; then
+            echo "Connector already registered — updating config..."
+            python - <<'PY' > /tmp/connector-config.json
+import json
+cfg = json.load(open('config/kafka-connect/postgres-source.json'))['config']
+print(json.dumps(cfg))
+PY
+
+            curl -s -X PUT -H 'Content-Type: application/json' \
+              --data @/tmp/connector-config.json \
+              http://127.0.0.1:8083/connectors/postgres-banking-cdc/config
+          else
+            echo "Creating new connector..."
+            curl -s -X POST -H 'Content-Type: application/json' \
+              --data @config/kafka-connect/postgres-source.json \
+              http://127.0.0.1:8083/connectors
+          fi
+
+          echo "✅ Connector registration complete."

@@ -13,7 +13,7 @@ services:
   # =========================================================================
   
   postgres:
-    image: debezium/postgres:15-alpine
+    image: banking-postgres:latest
     entrypoint:
       - /bin/bash
       - /docker-entrypoint-initdb.d/postgres-init.sh
@@ -32,7 +32,7 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./postgres-init.sh:/docker-entrypoint-initdb.d/postgres-init.sh:ro
+      # init script is baked into the image to avoid fragile host-bind mounts in Swarm
     networks:
       - fraud_network
     deploy:
