@@ -13,9 +13,11 @@ services:
   # =========================================================================
   
   postgres:
-    image: debezium/postgres:15-alpine
+    image: banking-postgres:latest
+    entrypoint:
+      - /bin/bash
+      - /docker-entrypoint-initdb.d/postgres-init.sh
     command:
-      - postgres
       - "-c"
       - "wal_level=logical"
       - "-c"
@@ -23,13 +25,14 @@ services:
       - "-c"
       - "max_wal_senders=4"
     environment:
-      POSTGRES_DB: bank_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres_password
+      POSTGRES_DB: banking_db
+      POSTGRES_USER: postgres_admin
+      POSTGRES_PASSWORD: SecureBankPassword2026!
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # init script is baked into the image to avoid fragile host-bind mounts in Swarm
     networks:
       - fraud_network
     deploy:
@@ -42,7 +45,7 @@ services:
   api:
     image: banking-api:latest
     environment:
-      DATABASE_URL: postgresql://postgres:postgres_password@postgres:5432/bank_db
+      DATABASE_URL: postgresql://postgres_admin:SecureBankPassword2026!@postgres:5432/banking_db
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
     ports:
@@ -106,7 +109,7 @@ services:
         done
 
         echo 'Provisioning Platform Topics...'
-        topics="api_requests dead_letter_queue fraud_alerts critical_alerts risk_scores enriched_transactions model_features banking.login_events banking.sessions banking.accounts banking.transactions banking.beneficiaries banking.employee_actions banking.unified_timeline"
+        topics="api_requests dead_letter_queue fraud_alerts critical_alerts risk_scores risk_scores_v2 fraud_alerts_v2 critical_alerts_v2 enriched_transactions model_features banking.login_events banking.sessions banking.accounts banking.transactions banking.beneficiaries banking.employee_actions banking.unified_timeline"
 
         for topic in $$topics; do
           kafka-topics \
@@ -241,6 +244,20 @@ services:
     command: taskmanager
     environment:
       JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-3
+      restart_policy:
+        condition: on-failure
+
+  flink-risk-engine:
+    image: banking-flink-risk-engine:latest
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      FLINK_RISK_GROUP_ID: fraud-engine-v2
     networks:
       - fraud_network
     deploy:

@@ -11,6 +11,11 @@ class LoginRequest(BaseModel):
     device_type: str
     ip_address: str
     country: str
+    # NEW — geo-point support (see LoginPayload in main.py, the schema
+    # actually used by /api/login; kept in sync here since this class
+    # documents the intended contract even though it isn't imported yet).
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 class TokenResponse(BaseModel):
     access_token: str

@@ -45,3 +45,4 @@ build/
 .DS_Store
 Thumbs.db
 libs/
+analytics/flink-risk-engine-java/target/

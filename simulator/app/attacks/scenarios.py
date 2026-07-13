@@ -4,6 +4,7 @@ import asyncio
 import uuid
 import os
 from faker import Faker
+from app.utils.generators import generate_geo_point
 
 fake = Faker()
 # Base URL targeting absolute root domain to prevent path-stripping
@@ -22,6 +23,7 @@ class ScenarioManager:
         target_device = str(uuid.uuid4())
         
         async with httpx.AsyncClient(base_url=API_URL) as client:
+            attacker_lat, attacker_lon = generate_geo_point("CN")
             for _ in range(25):
                 payload = {
                     "username": f"cust_gen_{random.randint(0, 20)}",
@@ -29,7 +31,9 @@ class ScenarioManager:
                     "device_id": target_device,
                     "device_type": "DESKTOP",
                     "ip_address": attacker_ip,
-                    "country": "CN"
+                    "country": "CN",
+                    "latitude": attacker_lat,
+                    "longitude": attacker_lon
                 }
                 try:
                     await client.post("/api/login", json=payload)
@@ -44,13 +48,16 @@ class ScenarioManager:
         
         async with httpx.AsyncClient(base_url=API_URL) as client:
             try:
+                victim_lat, victim_lon = generate_geo_point("RU")
                 await client.post("/api/login", json={
                     "username": victim_cust_id,
                     "password": "SecurePassword123!",
                     "device_id": str(uuid.uuid4()),
                     "device_type": "MOBILE",
                     "ip_address": "185.220.101.5",
-                    "country": "RU"
+                    "country": "RU",
+                    "latitude": victim_lat,
+                    "longitude": victim_lon
                 }, headers=rogue_headers)
                 await asyncio.sleep(0.5)
                 
@@ -121,6 +128,7 @@ class ScenarioManager:
         attacker_device = str(uuid.uuid4())
         
         async with httpx.AsyncClient(base_url=API_URL) as client:
+            attacker_lat, attacker_lon = generate_geo_point("UA")
             for _ in range(30):
                 rand_idx = random.randint(0, total_generated_users - 1)
                 try:
@@ -129,7 +137,9 @@ class ScenarioManager:
                         "password": "Spring2026!@#",
                         "device_id": attacker_device,
                         "ip_address": attacker_ip,
-                        "country": "UA"
+                        "country": "UA",
+                        "latitude": attacker_lat,
+                        "longitude": attacker_lon
                     })
                 except httpx.RequestError:
                     pass
@@ -221,14 +231,24 @@ class ScenarioManager:
     @staticmethod
     async def run_cyber_infrastructure_attack():
         print("\n[🚨 ATTACK ENGAGED] Triggering Botnet DDoS Flood on Authentication Gateways...")
+        
+        # A list of diverse country codes to simulate a distributed global botnet
+        botnet_countries = ["CN", "RU", "BR", "IN", "VN", "US", "UA", "IR", "DE", "ZA"]
+        
         async with httpx.AsyncClient(base_url=API_URL) as client:
             async def single_bot_strike():
                 bot_ip = f"172.16.{random.randint(0,255)}.{random.randint(1,254)}"
+                bot_country = random.choice(botnet_countries)
+                bot_lat, bot_lon = generate_geo_point(bot_country)
+                
                 try:
                     await client.post("/api/login", json={
                         "username": f"cust_gen_{random.randint(0, 20)}",
                         "password": "BruteForceAttackStrikes99!",
-                        "ip_address": bot_ip
+                        "ip_address": bot_ip,
+                        "country": bot_country,
+                        "latitude": bot_lat,
+                        "longitude": bot_lon
                     })
                 except httpx.RequestError:
                     pass
@@ -256,13 +276,16 @@ class ScenarioManager:
         print(f"\n[🚨 ATTACK ENGAGED] Exploit Attempt using Blacklisted Device: {rogue_device}...")
         async with httpx.AsyncClient(base_url=API_URL) as client:
             try:
+                device_lat, device_lon = generate_geo_point("US")
                 await client.post("/api/login", json={
                     "username": victim_user,
                     "password": "ValidOrGuessedPassword123!",
                     "device_id": rogue_device,
                     "device_type": "EMULATOR",
                     "ip_address": f"198.51.100.{random.randint(1, 254)}",
-                    "country": "US"
+                    "country": "US",
+                    "latitude": device_lat,
+                    "longitude": device_lon
                 }, headers={"X-User-Id": victim_user})
                 
                 await asyncio.sleep(0.5)
@@ -366,6 +389,7 @@ class ScenarioManager:
 
         async with httpx.AsyncClient(base_url=API_URL) as client:
             print(" -> Step 1: Ring members authenticating from shared infrastructure")
+            shared_lat, shared_lon = generate_geo_point("US")
             for member in ring_members:
                 try:
                     await client.post("/api/login", json={
@@ -374,7 +398,9 @@ class ScenarioManager:
                         "device_id": shared_device,
                         "device_type": "DESKTOP",
                         "ip_address": shared_ip,
-                        "country": "US"
+                        "country": "US",
+                        "latitude": shared_lat,
+                        "longitude": shared_lon
                     })
                 except httpx.RequestError:
                     pass

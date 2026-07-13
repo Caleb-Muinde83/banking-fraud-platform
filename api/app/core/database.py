@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 ROOT_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT_DIR / ".env")
 
-# Fallback to local development connection string if environment variable isn't injected yet
+# Fallback to the same database values used by the local Docker stack and .env file
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     f"postgresql://{os.getenv('POSTGRES_USER', 'postgres_admin')}:{os.getenv('POSTGRES_PASSWORD', 'SecureBankPassword2026!')}@"

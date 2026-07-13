@@ -1,5 +1,5 @@
 import datetime
-from sqlalchemy import Column, String, Integer, Numeric, Boolean, DateTime, ForeignKey
+from sqlalchemy import Column, String, Integer, Numeric, Boolean, DateTime, ForeignKey, Float
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -48,6 +48,11 @@ class LoginEvent(Base):
     country = Column(String, nullable=False)
     ip_address = Column(String, nullable=False)
     success = Column(Boolean, nullable=False)
+    # NEW — geo-point support for the OpenSearch "failed logins" map goal.
+    # Nullable: existing rows (pre-migration) and any caller that doesn't
+    # supply coordinates simply have no geo data, rather than failing.
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
 
 class Device(Base):

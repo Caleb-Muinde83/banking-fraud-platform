@@ -5,8 +5,14 @@ on:
     branches:
       - main
     paths:
-      - "banking-fraud-platform/**"
+      - "api/**"
+      - "backend/**"
+      - "simulator/**"
+      - "config/**"
+      - "infra/**"
+      - "docker-compose.yml"
       - ".github/workflows/deploy.yml"
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -23,6 +29,9 @@ jobs:
       - name: Build Threat Simulator Local Image
         # Notice we changed '.' to './simulator'
         run: docker build -t banking-simulator:latest ./simulator
+
+      - name: Build Postgres DB Image
+        run: docker build -f infra/postgres.Dockerfile -t banking-postgres:latest infra/
 
       - name: Deploy Orchestration Stack to Swarm
         run: docker stack deploy -c infra/docker-compose.yml fraud_platform
@@ -47,3 +56,30 @@ jobs:
             echo "❌❌❌ Kafka Connect failed to become ready within 3 minutes."
             exit 1
           fi
+
+      - name: Register Postgres CDC Connector
+        run: |
+          echo "Registering Debezium connector from config/kafka-connect/postgres-source.json..."
+
+          STATUS_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8083/connectors/postgres-banking-cdc)
+
+          if [ "$STATUS_CODE" -eq 200 ]; then
+            echo "Connector already registered — updating config..."
+            if command -v jq >/dev/null 2>&1; then
+              jq '.config' config/kafka-connect/postgres-source.json > /tmp/connector-config.json
+            else
+              echo "jq not found; extracting config using python in a docker container"
+              docker run --rm -v "$PWD":/work -w /work python:3.11-slim python -c "import json,sys; print(json.dumps(json.load(open('config/kafka-connect/postgres-source.json'))['config']))" > /tmp/connector-config.json
+            fi
+
+            curl -s -X PUT -H 'Content-Type: application/json' \
+              --data @/tmp/connector-config.json \
+              http://127.0.0.1:8083/connectors/postgres-banking-cdc/config
+          else
+            echo "Creating new connector..."
+            curl -s -X POST -H 'Content-Type: application/json' \
+              --data @config/kafka-connect/postgres-source.json \
+              http://127.0.0.1:8083/connectors
+          fi
+
+          echo "✅ Connector registration complete."
