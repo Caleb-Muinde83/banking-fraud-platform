@@ -109,7 +109,7 @@ services:
         done
 
         echo 'Provisioning Platform Topics...'
-        topics="api_requests dead_letter_queue fraud_alerts critical_alerts risk_scores enriched_transactions model_features banking.login_events banking.sessions banking.accounts banking.transactions banking.beneficiaries banking.employee_actions banking.unified_timeline"
+        topics="api_requests dead_letter_queue fraud_alerts critical_alerts risk_scores risk_scores_v2 fraud_alerts_v2 critical_alerts_v2 enriched_transactions model_features banking.login_events banking.sessions banking.accounts banking.transactions banking.beneficiaries banking.employee_actions banking.unified_timeline"
 
         for topic in $$topics; do
           kafka-topics \
@@ -244,6 +244,20 @@ services:
     command: taskmanager
     environment:
       JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-3
+      restart_policy:
+        condition: on-failure
+
+  flink-risk-engine:
+    image: banking-flink-risk-engine:latest
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      FLINK_RISK_GROUP_ID: fraud-engine-v2
     networks:
       - fraud_network
     deploy:

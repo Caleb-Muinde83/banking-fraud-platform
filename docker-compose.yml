@@ -186,6 +186,9 @@ services:
         fraud_alerts
         critical_alerts
         risk_scores
+        risk_scores_v2
+        fraud_alerts_v2
+        critical_alerts_v2
         enriched_transactions
         model_features
         banking.login_events
@@ -214,6 +217,24 @@ services:
     restart: "no"
 
   # =========================================================================
+  # Flink Fraud Engine
+  # =========================================================================
+  fraud-engine:
+    build:
+      context: ./analytics/flink-risk-engine-java
+      dockerfile: Dockerfile
+    container_name: bank_fraud_engine
+    depends_on:
+      - kafka
+      - schema-registry
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      FLINK_RISK_GROUP_ID: fraud-engine-v2
+      KAFKA_FRAUD_ALERT_TOPIC: fraud_alerts_v2
+      KAFKA_CRITICAL_ALERT_TOPIC: critical_alerts_v2
+    restart: unless-stopped
+
+  # =========================================================================
   # OpenSearch (Search, Analytics & Threat Hunting)
   # =========================================================================
   opensearch:
@@ -225,7 +246,10 @@ services:
       - discovery.type=single-node
       - bootstrap.memory_lock=true
       - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m" 
-      - DISABLE_SECURITY_PLUGIN=true               
+      # DISABLE_SECURITY_PLUGIN removed — security plugin now enabled.
+      # On 2.11.0 this installs the demo config automatically with the
+      # default admin/admin credentials; no extra password env var needed
+      # (that requirement only starts at 2.12).             
     ulimits:
       memlock:
         soft: -1
@@ -249,8 +273,36 @@ services:
     ports:
       - "5601:5601"
     environment:
-      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
-      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_HOSTS=["https://opensearch:9200"]
+      - OPENSEARCH_SSL_VERIFICATIONMODE=none
+      - OPENSEARCH_USERNAME=admin
+      - OPENSEARCH_PASSWORD=admin
+      # DISABLE_SECURITY_PLUGIN removed — Dashboards now shows a real login
+      # page at http://localhost:5601/app/login. Its own port stays plain
+      # HTTP by default (server.ssl.enabled is off unless set) — only the
+      # backend connection to OpenSearch needs https + verification off,
+      # since the demo certs are self-signed.
     depends_on:
       - opensearch
     restart: unless-stopped
+
+  # =========================================================================
+  # OpenSearch Sink (Kafka -> OpenSearch ingestion daemon)
+  # =========================================================================
+  opensearch-sink:
+    build:
+      context: ./analytics/opensearch
+      dockerfile: Dockerfile
+    container_name: bank_opensearch_sink
+    depends_on:
+      - kafka
+      - opensearch
+      - schema-registry
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      OPENSEARCH_HOST: opensearch
+      OPENSEARCH_PORT: "9200"
+      OPENSEARCH_USER: admin
+      OPENSEARCH_PASSWORD: admin
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    restart: unless-stopped 

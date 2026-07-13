@@ -53,7 +53,9 @@ class AsyncCustomerActor:
             "device_id": self.device["device_id"],
             "device_type": self.device["device_type"],
             "ip_address": self.network["ip_address"],
-            "country": self.network["country"]
+            "country": self.network["country"],
+            "latitude": self.network["latitude"],
+            "longitude": self.network["longitude"]
         }
         try:
             # Explicitly prefixing with /api to guarantee accurate backend routing

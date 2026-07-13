@@ -24,7 +24,7 @@ import app.middleware.kafka_logger as kafka_logger
 # SQLAlchemy Async Components
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from sqlalchemy.dialects.postgresql import insert
 
 # Import core structural routing endpoints and domains
@@ -106,6 +106,14 @@ async def startup_pipeline_provisioning():
     # Trigger DDL Generation on the target cluster asynchronously
     async with engine.begin() as conn:
         await conn.run_sync(models.Base.metadata.create_all)
+        
+        # 2. Force schema migrations for existing persisted tables
+        await conn.execute(text("""
+            ALTER TABLE public.login_events 
+            ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION, 
+            ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+        """))
+        print("[Schema Update] Verified geo-columns exist on login_events.")
 
     # Core system demographic seeding engine
     async with AsyncSessionLocal() as db:
@@ -194,6 +202,12 @@ class LoginPayload(BaseModel):
     device_type: Optional[str] = "DESKTOP"
     ip_address: Optional[str] = "127.0.0.1"
     country: Optional[str] = "US"
+    # NEW — geo-point support. The API just persists whatever the caller
+    # supplies (simulator, or a real client) — no geolocation logic lives
+    # here. See simulator/app/utils/generators.py for how the simulator
+    # derives these from the country it already assigns.
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 class TransferPayload(BaseModel):
     from_account: str
@@ -247,6 +261,7 @@ async def api_login(payload: LoginPayload, db: AsyncSession = Depends(get_db)):
     login_ev = models.LoginEvent(
         event_id=ev_id, customer_id=payload.username, device_id=payload.device_id,
         country=payload.country, ip_address=payload.ip_address, success=is_success,
+        latitude=payload.latitude, longitude=payload.longitude,
         timestamp=datetime.utcnow()
     )
     db.add(login_ev)
