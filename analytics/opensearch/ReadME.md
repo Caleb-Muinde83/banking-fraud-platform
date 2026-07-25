@@ -352,3 +352,51 @@ opensearch-sink:
   dependency (C-extension based, needs `librdkafka`); worth confirming that's
   acceptable in the sink's runtime image versus a pure-Python alternative
   (`fastavro` + manual registry fetch) if dependency weight is a concern.
+
+
+  *************************************************
+  *****************************************************
+# OpenSearch Dashboards One-Time Setup
+
+> **Note:** This setup has not been completed yet. Without index patterns, the **Discover** tab will remain empty even when data exists in OpenSearch indices.
+
+## Open OpenSearch Dashboards
+
+Navigate to:
+
+```text
+http://localhost:5601/app/login
+```
+
+Log in using:
+
+```text
+Username: admin
+Password: admin
+```
+
+## Create Index Patterns
+
+From the left sidebar:
+
+```text
+Dashboards Management → Index Patterns → Create index pattern
+```
+
+Create the following index patterns:
+
+- `login_events`
+- `api_requests`
+- `alerts`
+
+## Configure Time Fields
+
+When creating each index pattern, select the correct time field:
+
+| Index Pattern | Time Field |
+|--------------|------------|
+| `login_events` | `timestamp` |
+| `api_requests` | `timestamp` |
+| `alerts` | `event_time` |
+
+> The `alerts` index uses `event_time` because it matches the actual `FraudAlert` schema and the OpenSearch mapping configuration.

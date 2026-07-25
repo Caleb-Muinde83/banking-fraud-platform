@@ -1,12 +1,18 @@
-# Python environment and cache
+# ==========================================
+# Python & Virtual Environments
+# ==========================================
 __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
 .mypy_cache/
 .python-version
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
 
-# Virtual environments
 venv/
 env/
 .venv/
@@ -15,34 +21,69 @@ env/
 api/venv/
 simulator/venv/
 
-# Environment files
+# ==========================================
+# Java & Maven (Flink Engine)
+# ==========================================
+analytics/flink-risk-engine-java/target/
+**/target/
+*.class
+*.jar
+*.war
+*.ear
+.mvn/
+maven-status/
+.factorypath
+.classpath
+.project
+.settings/
+
+# ==========================================
+# Environment & Security
+# ==========================================
 .env
 .env.*
 *.env
+*.pem
+*.crt
+*.key
 
-# Editor and IDE
+# ==========================================
+# IDEs & Editors
+# ==========================================
 .vscode/
 .idea/
+*.iml
 *.suo
 *.user
 *.userosscache
 *.sln.docstates
+*.swp
+*.swo
 
-# Logs
+# ==========================================
+# Runtime Service Data & Logs
+# ==========================================
 *.log
 logs/
-
-# Runtime service data
 persisted-volumes/
 **/persisted-volumes/
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.sql
 
-# Packaging
-*.egg-info/
-dist/
-build/
+# ==========================================
+# Docker & Containers
+# ==========================================
+docker-compose.override.yml
 
-# OS files
+# ==========================================
+# OS & Archives
+# ==========================================
 .DS_Store
 Thumbs.db
 libs/
-analytics/flink-risk-engine-java/target/
+*.zip
+*.tar.gz
+*.7z

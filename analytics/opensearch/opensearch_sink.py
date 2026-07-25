@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 
 from confluent_kafka import Consumer, KafkaError
 from confluent_kafka.schema_registry import SchemaRegistryClient
@@ -29,26 +30,29 @@ AUTH = (
 # already carried in each FraudAlert payload distinguishes them for
 # querying, so there's no need for two separate indices just because
 # there are now two Kafka topics.
+#
+# Added "banking.employee_actions" -> "employee_actions" to unblock
+# Phase 4 Insider Threat Hunting queries. Confirmed this topic is real:
+# public.employee_actions is in Debezium's table.include.list already.
 TOPIC_INDEX_MAP = {
     "api_requests": "api_requests",
     "banking.login_events": "login_events",
+    "banking.employee_actions": "employee_actions",
     "fraud_alerts_v2": "alerts",
     "critical_alerts_v2": "alerts",
 }
 
-# CHANGED: these two topics are Avro (Schema-Registry-registered, written
-# by FraudAlertAvroSerializationSchema on the Flink side) — everything else
-# in TOPIC_INDEX_MAP is plain JSON (Debezium's JsonConverter for CDC
-# topics, and the API's json.dumps-based Kafka producer for api_requests).
-# A single deserializer can't handle both, so each message is deserialized
-# per-topic in the consume loop below instead.
-AVRO_TOPICS = {"fraud_alerts_v2", "critical_alerts_v2"}
+# FIXED: Added "api_requests" to AVRO_TOPICS. The API's telemetry middleware
+# transmits these events using Confluent's AvroSerializer, wrapping the message 
+# payload in binary format rather than raw JSON strings. Adding it here directs 
+# the deserializer to parse the Confluent wire-format schema bytes correctly.
+AVRO_TOPICS = {"fraud_alerts_v2", "critical_alerts_v2", "api_requests"}
 
 # CHANGED: CDC topics need their Debezium envelope ({before, after, source,
 # op, ts_ms}) unwrapped before indexing — previously the raw envelope was
 # indexed as-is, leaving every explicitly-mapped field empty since the real
 # data sits one level deeper, under `after.*`.
-CDC_TOPICS = {"banking.login_events"}
+CDC_TOPICS = {"banking.login_events", "banking.employee_actions"}
 
 # NEW — security plugin is now enabled on the OpenSearch backend (see
 # docker-compose.yml), which also switches the REST layer to HTTPS with
@@ -61,9 +65,6 @@ os_client = OpenSearch(
     use_ssl=True,
     verify_certs=False,
     ssl_show_warn=False
-    timeout=60,             # NEW: Give OpenSearch 60 seconds to respond
-    max_retries=3,          # NEW: Automatically retry if it fails
-    retry_on_timeout=True   # NEW: Don't just give up on a timeout
 )
 
 # NEW — Schema-Registry-aware Avro deserializer for the two alert topics.
@@ -114,8 +115,30 @@ def initialize_indices():
                     "device_id":  {"type": "keyword"},
                     # NEW — geo-point support, derived from the new
                     # latitude/longitude columns at index time (see
-                    # build_geo_point below).
+                    # apply_geo_point below).
                     "geo_location": {"type": "geo_point"}
+                }
+            }
+        },
+        "employee_actions": {
+            "mappings": {
+                "properties": {
+                    # CORRECTED: matches the real employee_actions table
+                    # exactly (models.py) -- action_id, employee_id,
+                    # customer_id, action_type, timestamp. Only 5 columns
+                    # exist. The previous version of this mapping invented
+                    # target_customer_id/account_id/ip_address/details,
+                    # none of which Debezium will ever actually send, and
+                    # renamed the real `customer_id` column to
+                    # `target_customer_id` -- which would have silently
+                    # broken the Phase 4 mass-exfiltration query, since
+                    # that query needs a cardinality aggregation on
+                    # exactly this field.
+                    "timestamp":   {"type": "date"},
+                    "action_id":   {"type": "keyword"},
+                    "employee_id": {"type": "keyword"},
+                    "customer_id": {"type": "keyword"},
+                    "action_type": {"type": "keyword"}
                 }
             }
         },
@@ -173,7 +196,8 @@ def unwrap_cdc_envelope(payload: dict):
     time.precision.mode — RiskEventNormalizer already relies on this same
     guarantee on the Flink side, so this keeps both consumers consistent
     with each other instead of each interpreting the row's own timestamp
-    column differently.
+    column differently. Applies equally to employee_actions -- same
+    Debezium connector, same time.precision.mode setting.
     """
     if payload.get("op") == "d":
         return None
@@ -194,7 +218,9 @@ def apply_geo_point(doc: dict) -> dict:
     in the geo-point schema migration) into the geo_location shape the
     index mapping above expects. No-op if either coordinate is missing
     (e.g. rows from before the migration, or a caller that didn't supply
-    geo data).
+    geo data). employee_actions has no lat/lon columns at all, so this is
+    a harmless no-op for that topic too -- only called for login_events
+    below, but safe regardless.
     """
     lat = doc.get("latitude")
     lon = doc.get("longitude")
@@ -219,28 +245,37 @@ def deserialize_message(topic: str, raw_key, raw_value):
 # -----------------------------------------------------------------------------
 # 4. KAFKA TO OPENSEARCH CONSUMER LOOP
 # -----------------------------------------------------------------------------
-def run_opensearch_sink():
-    initialize_indices()
+def consume_topic(topic: str, target_index: str):
+    """
+    Runs a dedicated, single-topic consumer loop.
 
-    # CHANGED: switched from kafka-python's KafkaConsumer (which forced a
-    # single value_deserializer for every subscribed topic — the root cause
-    # of the Avro-crashes-the-whole-process bug) to confluent-kafka's raw
-    # Consumer, which hands back undecoded bytes so deserialization can be
-    # chosen per-message based on topic.
-    # CHANGED: enable.auto.commit was True — meaning offsets advanced on a
-    # timer regardless of whether indexing actually succeeded, so a message
-    # that failed to index was still marked "consumed" and would never be
-    # retried, even on a sink restart. Manual commit (see the success path
-    # below) ties offset advancement to actual indexing success instead.
+    CHANGED: previously one Consumer subscribed to ALL FOUR topics at once,
+    processing whatever poll() returned, serially. Confirmed via
+    `kafka-consumer-groups --describe` that this caused real starvation, not
+    just theoretical risk: banking.login_events had ~77,000 messages of
+    lag on a single partition (from an earlier offset replay), and
+    fraud_alerts_v2/critical_alerts_v2 showed CURRENT-OFFSET "-" — meaning
+    the consumer had NEVER once committed an offset for either alert topic,
+    despite Flink having already produced 132 real alert messages between
+    them. The single poll loop was continuously fed login_events messages
+    and never got a batch containing anything else.
+
+    Giving every topic its own thread + its own Consumer instance means a
+    large backlog on one topic can never block processing of another,
+    regardless of size. All threads share the same group.id
+    ("opensearch-sink-group") — this is safe: Kafka tracks committed
+    offsets per (group, topic, partition) independently, and group members
+    are allowed to have different subscriptions, so there's no partition-
+    assignment conflict between threads subscribed to disjoint topics.
+    """
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BROKER,
         "group.id": "opensearch-sink-group",
         "auto.offset.reset": "earliest",
         "enable.auto.commit": False,
     })
-    consumer.subscribe(list(TOPIC_INDEX_MAP.keys()))
-
-    print("📥 OpenSearch Sink Daemon listening to Kafka streams. Ready to index...")
+    consumer.subscribe([topic])
+    print(f"📥 Started dedicated consumer thread for [{topic}] -> index [{target_index}]")
 
     try:
         while True:
@@ -250,54 +285,68 @@ def run_opensearch_sink():
             if msg.error():
                 if msg.error().code() == KafkaError._PARTITION_EOF:
                     continue
-                print(f"❌ Kafka consumer error: {msg.error()}")
+                print(f"❌ Kafka consumer error on {topic}: {msg.error()}")
                 continue
 
-            topic = msg.topic()
-
-            # CHANGED: deserialization now happens INSIDE this try/except,
-            # not before it. Previously a malformed/Avro-on-JSON-consumer
-            # message would raise during kafka-python's iteration mechanics,
-            # outside any try/except — killing the entire consumer loop on
-            # the very first bad message, not just failing that one record.
             try:
-                target_index = TOPIC_INDEX_MAP[topic]
                 payload = deserialize_message(topic, msg.key(), msg.value())
 
                 if topic in CDC_TOPICS:
                     payload = unwrap_cdc_envelope(payload)
                     if payload is None:
-                        # Delete event — nothing to index.
+                        # Delete event — legitimately nothing to index, not
+                        # a failure. FIXED: previously this `continue`d
+                        # without committing, so delete events were
+                        # redelivered forever on every sink restart instead
+                        # of being acknowledged once and moving on.
+                        consumer.commit(message=msg, asynchronous=False)
                         continue
                     payload = apply_geo_point(payload)
 
-                response = os_client.index(
-                    index=target_index,
-                    body=payload,
-                    refresh=True  # Force immediate indexing for near real-time threat hunting
-                )
-                print(f"⚡ Indexed doc into [{target_index}] | Doc ID: {response['_id']}")
+                # CHANGED: removed refresh=True. Forcing a synchronous
+                # Lucene segment refresh on every single document was slow
+                # enough under login_events' volume to blow past the
+                # consumer's session.timeout.ms (confirmed by the
+                # "SESSTMOUT... revoking assignment and rejoining group"
+                # warning in the sink's own logs), triggering repeated
+                # rebalances. OpenSearch's default ~1s background refresh
+                # is still near-real-time for a threat-hunting dashboard
+                # and doesn't block the consumer loop on every write.
+                response = os_client.index(index=target_index, body=payload)
+                print(f"⚡ Indexed doc into [{target_index}] | Doc ID: {response['_id']}\nPayload: {payload}")
 
-                # NEW — offset only advances here, after indexing has
-                # actually succeeded. Synchronous (asynchronous=False):
-                # indexing is already synchronous per-message due to
-                # refresh=True above, so this doesn't change the throughput
-                # profile, and it means a failed commit is caught here
-                # rather than silently swallowed by an async callback.
                 consumer.commit(message=msg, asynchronous=False)
 
             except Exception as e:
                 print(f"❌ Error indexing message from topic {topic}: {str(e)}")
-                # Deliberately no commit here — this message's offset is
-                # NOT advanced. On a sink restart, it will be redelivered
-                # from the last successfully committed offset rather than
-                # being silently skipped forever. During continuous
-                # operation (no restart), processing still moves on to the
-                # next message on the next poll() — this isn't a blocking
-                # retry loop, just a stronger recovery guarantee.
+                # No commit — see the module-level note on manual commit
+                # semantics: this message gets redelivered from the last
+                # good offset on a sink restart rather than being skipped.
                 continue
     finally:
         consumer.close()
+
+
+def run_opensearch_sink():
+    initialize_indices()
+    print("📥 OpenSearch Sink Daemon starting — one dedicated consumer thread per topic...")
+
+    threads = []
+    for topic, target_index in TOPIC_INDEX_MAP.items():
+        t = threading.Thread(
+            target=consume_topic,
+            args=(topic, target_index),
+            daemon=True,
+            name=f"consumer-{topic}"
+        )
+        t.start()
+        threads.append(t)
+
+    # Block forever on the threads rather than returning — they're daemon
+    # threads (die with the process), but this keeps main() alive to host
+    # them, and surfaces a thread dying unexpectedly via join() returning.
+    for t in threads:
+        t.join()
 
 
 if __name__ == "__main__":

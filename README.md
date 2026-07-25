@@ -1441,3 +1441,467 @@ depending on this topic's schema.
   Recommended next step: bring up the stack, trigger a simulator scenario (e.g.
   `wire_fraud`), and confirm an alert lands on `fraud_alerts_v2` with the expected
   severity end to end.
+
+
+**************************************************
+
+# 4. `check_port_8000.ps1`
+
+Place this script wherever is most convenient (for example, in the repository root).
+
+This is not a code fix—there is no code-based solution for a stray process occupying the port. Instead, it serves as a quick pre-flight check that takes only a few seconds to run before starting the simulator.
+
+## Run the Script
+
+```powershell
+powershell -ExecutionPolicy Bypass -File check_port_8000.ps1
+```
+
+## What It Does
+
+The script checks for any process bound specifically to:
+
+```text
+127.0.0.1:8000
+```
+
+This is the exact conflict pattern that caused the issue previously.
+
+If a matching process is found, the script:
+
+- Displays the process ID (PID).
+- Prints the full command line used to launch the process.
+- Provides the correctly escaped `taskkill` command immediately.
+
+This avoids the usual `MINGW64` path-mangling problems and makes it easy to terminate the offending process before launching the simulator.
+
+---
+
+**********************************************************
+# Docker Compose Service Overview
+
+When you run:
+
+```bash
+docker compose up
+```
+
+Docker automatically spins up every container service defined in your `docker-compose.yml` file.
+
+If you then manually start the FastAPI backend outside Docker (for example, by running `uvicorn main:app` in your host terminal), two major problems occur:
+
+- **Port Collision:** Both instances compete for port `8000`.
+- **Network Mismatch:** The manually started API connects to `localhost:29092`, while the Dockerized API connects to the internal Docker network at `kafka:29092`.
+
+---
+
+# 1. Automatically Started Services (Managed by Docker)
+
+These services start and remain running inside Docker containers whenever you execute:
+
+```bash
+docker compose up -d
+```
+
+| Container Name | Service in `docker-compose.yml` | What It Does |
+|---|---|---|
+| `bank_api` | `api` | **FastAPI Backend:** Handles user logins, transfers, and emits telemetry events via `Kafka` using `RequestLoggerMiddleware`. |
+| `bank_opensearch_sink` | `opensearch-sink` | **Ingestion Daemon:** The Python script (`opensearch_sink.py`) that reads messages from Kafka topics (`api_requests`, `banking.login_events`, `fraud_alerts_v2`, `critical_alerts_v2`) and writes them directly into OpenSearch. |
+| `bank_postgres` | `postgres` | **Transactional Database:** Stores accounts, logins, and sessions, configured with logical replication (`wal_level=logical`) for CDC. |
+| `bank_kafka` | `kafka` | **Event Streaming Broker:** Manages topics and buffers raw streaming messages across all partitions. |
+| `bank_schema_registry` | `schema-registry` | **Confluent Schema Registry:** Stores and validates Avro schemas for structured payloads (for example, `api_requests` and `fraud_alerts_v2`). |
+| `bank_debezium` | `debezium` | **CDC Connector:** Captures PostgreSQL database mutations in real time and publishes them to Kafka topics such as `banking.login_events`. |
+| `bank_opensearch` | `opensearch` | **Search & Analytics Engine:** Stores indexed documents for fast querying. |
+| `bank_opensearch_dashboards` | `opensearch-dashboards` | **Web UI (Port `5601`):** Visualization dashboard for viewing alerts, logs, and user telemetry. |
+| `bank_flink_jobmanager` / `bank_flink_taskmanager` | `flink-jobmanager` / `taskmanager` | **Apache Flink Engine:** Evaluates fraud-detection rules in real time across incoming event streams. |
+
+---
+
+# 2. Manually Started Services & Scripts
+
+These components live outside the core daemon stack and must be executed manually when testing or generating traffic.
+
+| Service / Script | How to Run It | Why It's Manual |
+|---|---|---|
+| Traffic Simulator (`simulator.py`) | `python simulator.py` (optionally inside a dedicated virtual environment) | Simulates external user traffic by continuously sending synthetic HTTP requests to `http://localhost:8000` to generate logins, transfers, and API activity. |
+| Ad-Hoc Query / Test Scripts | `python test_auth.py` or `curl` | Used to trigger edge cases or manually test security and fraud-detection rules against the API endpoint. |
+| Flink Job Submission (if not auto-submitted) | `docker exec bank_flink_jobmanager flink run ...` | Submits or updates streaming pipeline JARs or PyFlink scripts on the running Flink cluster. |
+
+---
+
+# Summary Checklist for a Clean System Run
+
+## 1. Start the Infrastructure Stack
+
+```bash
+docker compose up -d
+```
+
+## 2. Verify Containers Are Healthy
+
+```bash
+docker compose ps
+```
+
+## 3. Run the Simulator (Only)
+
+```bash
+python simulator.py
+```
+
+## 4. View Real-Time Data
+
+Open OpenSearch Dashboards in your browser:
+
+```text
+https://localhost:5601
+```
+
+Use it to query:
+
+- `api_requests`
+- `login_events`
+- `fraud_alerts_v2`
+- `critical_alerts_v2`
+
+---
+
+# Threat Hunting Execution & Validation Report
+
+**Environment:** Banking Fraud & Threat Analytics Platform
+**Target Engine:** OpenSearch
+**Execution Status:** ✅ **ALL PASSED (4/4 Queries Executed Successfully)**
+
+## Executive Summary
+
+| # | Target Index       | Query Intent                                    | Execution Status | Matches (Hits) | Risk Assessment                                                  |
+| - | ------------------ | ----------------------------------------------- | ---------------- | -------------: | ---------------------------------------------------------------- |
+| 1 | `employee_actions` | Mass Exfiltration / High-Volume Customer Access | SUCCESS          |          6,525 | 🚨 **HIGH RISK:** Potential insider data harvesting detected     |
+| 2 | `employee_actions` | Targeted Audit on Employee `EMP_001`            | SUCCESS          |              0 | 🟢 **CLEAN:** No actions found for target ID (expected)          |
+| 3 | `api_requests`     | API Reconnaissance & Failed Requests (`!200`)   | SUCCESS          |              0 | 🟢 **CLEAN:** Zero non-200 API errors in the past hour           |
+| 4 | `alerts`           | High & Critical Severity Fraud Event Triaging   | SUCCESS          |             78 | ⚠️ **ACTION REQUIRED:** 78 active alerts requiring account locks |
+
+---
+
+# Detailed Threat Hunting Query Analysis
+
+## Query 1: Mass Exfiltration / Insider Threat Aggregation
+
+### Purpose
+
+Identifies employees viewing an unusually high volume of unique customer accounts within a 24-hour window, sorting by unique customer cardinality to uncover potential insider data scraping.
+
+### OpenSearch DSL Query
+
+```json
+GET /employee_actions/_search
+{
+  "size": 0,
+  "query": {
+    "range": {
+      "timestamp": {
+        "gte": "now-24h"
+      }
+    }
+  },
+  "aggs": {
+    "employees": {
+      "terms": {
+        "field": "employee_id",
+        "size": 10,
+        "order": {
+          "unique_customers_accessed": "desc"
+        }
+      },
+      "aggs": {
+        "unique_customers_accessed": {
+          "cardinality": {
+            "field": "customer_id"
+          }
+        },
+        "action_breakdown": {
+          "terms": {
+            "field": "action_type"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### Execution Findings & Security Analysis
+
+* **Execution Status:** Successful (`took: 1026ms`, `1 shard successful`)
+* **Total Matching Documents:** `6,525`
+
+#### Top Anomalous Actors
+
+* `emp_mgr_02`: `3,505` `VIEW_ACCOUNT` operations across `23` unique customer accounts.
+* `emp_teller_01`: `3,020` `VIEW_ACCOUNT` operations across `23` unique customer accounts.
+
+#### Threat Assessment
+
+Potential insider threat or compromised employee credentials. Both accounts are performing high-frequency lookup operations across identical customer clusters.
+
+#### Schema Verification
+
+Confirms `customer_id` and `employee_id` are stored as pure keyword types, enabling precise cardinality and terms aggregation without tokenization errors.
+
+---
+
+## Query 2: Targeted Employee Audit (`EMP_001`)
+
+### Purpose
+
+Audits all historical activities for a specific employee identifier (`EMP_001`) within the last 7 days.
+
+### OpenSearch DSL Query
+
+```json
+GET /employee_actions/_search
+{
+  "size": 100,
+  "sort": [
+    {
+      "timestamp": {
+        "order": "desc"
+      }
+    }
+  ],
+  "query": {
+    "bool": {
+      "must": [
+        {
+          "term": {
+            "employee_id": "EMP_001"
+          }
+        }
+      ],
+      "filter": [
+        {
+          "range": {
+            "timestamp": {
+              "gte": "now-7d"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+### Execution Findings & Security Analysis
+
+* **Execution Status:** Successful (`took: 569ms`, `1 shard successful`)
+* **Total Matching Documents:** `0`
+
+#### Threat Assessment
+
+Valid execution with zero hits. Analysis of Query 1 indicates active synthetic employee IDs follow the `emp_mgr_XX` and `emp_teller_XX` naming convention rather than `EMP_001`.
+
+#### Schema Verification
+
+Exact-match term filter ran on `employee_id.keyword` without throwing string-matching exceptions.
+
+---
+
+## Query 3: Suspicious API Errors & Probing Detection
+
+### Purpose
+
+Detects potential endpoint fuzzing, credential stuffing, or broken object-level authorization (BOLA) attempts by aggregating non-200 HTTP response status codes grouped by client IP over the last 1 hour.
+
+### OpenSearch DSL Query
+
+```json
+GET /api_requests/_search
+{
+  "size": 0,
+  "query": {
+    "bool": {
+      "must_not": [
+        {
+          "term": {
+            "status_code": 200
+          }
+        }
+      ],
+      "filter": [
+        {
+          "range": {
+            "timestamp": {
+              "gte": "now-1h"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "aggs": {
+    "suspicious_ips": {
+      "terms": {
+        "field": "ip_address",
+        "size": 10
+      },
+      "aggs": {
+        "targeted_endpoints": {
+          "terms": {
+            "field": "endpoint"
+          }
+        },
+        "error_codes": {
+          "terms": {
+            "field": "status_code"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### Execution Findings & Security Analysis
+
+* **Execution Status:** Successful (`took: 164ms`, `1 shard successful`)
+* **Total Matching Documents:** `0`
+
+#### Threat Assessment
+
+No failed API interactions or suspicious HTTP responses observed in the last 60 minutes. All system API endpoints reported normal HTTP `200 OK` operations.
+
+---
+
+## Query 4: High & Critical Fraud Alerts Triaging
+
+### Purpose
+
+Retrieves real-time alerts emitted by the Flink Streaming Engine filtered for `CRITICAL` or `HIGH` severity levels over the last 24 hours, ordered chronologically to prioritize immediate SOC triage.
+
+### OpenSearch DSL Query
+
+```json
+GET /alerts/_search
+{
+  "size": 50,
+  "sort": [
+    {
+      "event_time": {
+        "order": "desc"
+      }
+    }
+  ],
+  "query": {
+    "bool": {
+      "should": [
+        {
+          "term": {
+            "severity": "CRITICAL"
+          }
+        },
+        {
+          "term": {
+            "severity": "HIGH"
+          }
+        }
+      ],
+      "minimum_should_match": 1,
+      "filter": [
+        {
+          "range": {
+            "event_time": {
+              "gte": "now-24h"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+### Execution Findings & Security Analysis
+
+* **Execution Status:** Successful (`took: 162ms`, `1 shard successful`)
+* **Total Matching Documents:** `78`
+
+#### Top High-Risk Fraud Findings Sample
+
+```json
+[
+  {
+    "alert_id": "custgen11-critical-1784598300000",
+    "customer_id": "cust_gen_11",
+    "severity": "CRITICAL",
+    "cumulative_score": 9020,
+    "threshold": 80,
+    "trigger_reason": "IMPOSSIBLE_TRAVEL",
+    "contributing_indicators": [
+      "NEW_COUNTRY",
+      "IMPOSSIBLE_TRAVEL",
+      "NEW_DEVICE"
+    ],
+    "action_required": "LOCK_ACCOUNT"
+  },
+  {
+    "alert_id": "custgen4-critical-1784598300000",
+    "customer_id": "cust_gen_4",
+    "account_id": "ACC-GEN00004",
+    "severity": "CRITICAL",
+    "cumulative_score": 6922,
+    "threshold": 80,
+    "trigger_reason": "LARGE_TRANSFER_AMOUNT",
+    "contributing_indicators": [
+      "IMPOSSIBLE_TRAVEL",
+      "NEW_DEVICE",
+      "NEW_COUNTRY",
+      "LARGE_TRANSFER_AMOUNT"
+    ],
+    "action_required": "LOCK_ACCOUNT"
+  }
+]
+```
+
+#### Threat Assessment
+
+Active automated threat response required. Multiple customers exhibit high risk scores (for example, score `9020` versus threshold `80`) driven by simultaneous impossible travel and new-device logins.
+
+Both alerts specify:
+
+```text
+action_required: LOCK_ACCOUNT
+```
+
+---
+
+# Conclusion & Next Actions
+
+## Schema Integrity Confirmed
+
+All OpenSearch indices properly map strings to keyword fields and dates to epoch/ISO timestamps. Aggregations, boolean filters, and range queries perform as expected without performance bottlenecks.
+
+## SOC Incident Escalation
+
+### Incident #1: Insider Risk
+
+Open an internal investigation ticket for employees:
+
+* `emp_mgr_02`
+* `emp_teller_01`
+
+Reason: Bulk `VIEW_ACCOUNT` queries across overlapping customer populations.
+
+### Incident #2: Automated Fraud
+
+Confirm execution of account-lock workflows (`LOCK_ACCOUNT`) for the following customer accounts:
+
+* `cust_gen_11`
+* `cust_gen_4`
+
+Reason: High-risk fraud indicators, including:
+
+* Impossible travel
+* New device access
+* New country logins
+* Large transfer amounts

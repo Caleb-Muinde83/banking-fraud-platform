@@ -10,6 +10,7 @@ import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend;
 import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.streaming.api.datastream.AsyncDataStream;
 import org.apache.flink.streaming.api.datastream.BroadcastStream;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -17,6 +18,7 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 
 public class RiskScoringJob {
     public static void main(String[] args) throws Exception {
@@ -81,8 +83,28 @@ public class RiskScoringJob {
         // fallback if the account mapping hasn't arrived yet) instead of
         // customerId directly — previously every api_requests event was
         // silently dropped here, so SUSPICIOUS_API_PATTERN could never fire.
-        DataStream<FraudAlert> alerts = enriched
-            .filter(event -> event.getIdentityKey() != null)
+        DataStream<RiskEvent> withIdentity = enriched.filter(event -> event.getIdentityKey() != null);
+
+        // NEW — Async I/O practice implementation (see OpenSearchLookupFunction
+        // for the full rationale). Placed here, after the identityKey filter
+        // (no point spending an async call on an event about to be dropped)
+        // and before watermarking/keying, since the lookup result doesn't
+        // affect either. unorderedWait is used rather than orderedWait since
+        // this side-lookup has no ordering requirement -- events can complete
+        // out of order without affecting correctness, which gives Flink more
+        // freedom to pipeline concurrent requests. 100 max in-flight requests
+        // bounds this so a slow/unreachable OpenSearch can't cause unbounded
+        // queueing; 5s timeout matches the HTTP client's own request timeout
+        // inside the function.
+        DataStream<RiskEvent> withHistoricalContext = AsyncDataStream.unorderedWait(
+            withIdentity,
+            new OpenSearchLookupFunction(),
+            5000L,
+            TimeUnit.MILLISECONDS,
+            100
+        ).name("opensearch-historical-lookup");
+
+        DataStream<FraudAlert> alerts = withHistoricalContext
             .assignTimestampsAndWatermarks(
                 WatermarkStrategy.<RiskEvent>forBoundedOutOfOrderness(Duration.ofSeconds(300))
                     .withTimestampAssigner((event, ignored) -> event.getEventTime())

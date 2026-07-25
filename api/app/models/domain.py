@@ -112,3 +112,14 @@ class AuditEvent(Base):
     action = Column(String, nullable=False)
     resource = Column(String, nullable=False)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+
+class Card(Base):
+    __tablename__ = "cards"
+    card_id = Column(String, primary_key=True, index=True)
+    customer_id = Column(String, ForeignKey("customers.customer_id"), nullable=False)
+    account_id = Column(String, ForeignKey("accounts.account_id"), nullable=True)
+    card_number = Column(String, unique=True, index=True, nullable=True)
+    card_type = Column(String, default="DEBIT")
+    status = Column(String, default="ACTIVE")
+    expiration_date = Column(String, nullable=True, default="12/29")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)

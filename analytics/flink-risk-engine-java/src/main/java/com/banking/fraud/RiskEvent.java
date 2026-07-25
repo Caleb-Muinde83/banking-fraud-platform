@@ -37,6 +37,14 @@ public class RiskEvent {
     // customer_id join (via banking.accounts) is added — see normalizer.
     private String identityKey;
 
+    // NEW — populated by OpenSearchLookupFunction (Async I/O practice
+    // implementation). Boolean, not boolean, on purpose: null means "not
+    // looked up yet, or the lookup failed/timed out" (fail-open), distinct
+    // from a real false meaning "looked up, genuinely never seen before
+    // the state window". Not currently read anywhere in scoring logic --
+    // deliberately left as a follow-up decision, not wired in yet.
+    private Boolean seenBeyondStateWindow;
+
     public RiskEvent() {}
 
     public RiskEvent(String eventId, String customerId, String accountId, String indicator, long eventTime,
@@ -91,4 +99,6 @@ public class RiskEvent {
     public void setToAccountId(String toAccountId) { this.toAccountId = toAccountId; }
     public String getIdentityKey() { return identityKey; }
     public void setIdentityKey(String identityKey) { this.identityKey = identityKey; }
+    public Boolean getSeenBeyondStateWindow() { return seenBeyondStateWindow; }
+    public void setSeenBeyondStateWindow(Boolean seenBeyondStateWindow) { this.seenBeyondStateWindow = seenBeyondStateWindow; }
 }

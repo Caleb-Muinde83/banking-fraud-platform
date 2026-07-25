@@ -391,3 +391,50 @@ depending on this topic's schema.
   Recommended next step: bring up the stack, trigger a simulator scenario (e.g.
   `wire_fraud`), and confirm an alert lands on `fraud_alerts_v2` with the expected
   severity end to end.
+
+
+  ****************************
+  *****************************
+# Running the Flink Risk Engine
+
+## Navigate to the Project Directory
+
+```bash
+cd banking-fraud-platform/analytics/flink-risk-engine-java
+```
+
+## Build the Project
+
+Package the application using Maven:
+
+```bash
+mvn clean package
+```
+
+## Copy the JAR to the Flink JobManager Container
+
+Copy the generated JAR file into the running Flink JobManager container:
+
+```bash
+docker cp target/flink-risk-engine-java-1.0-SNAPSHOT.jar bank_flink_jobmanager:/tmp/job.jar
+```
+
+Expected output:
+
+```text
+Successfully copied 122MB to bank_flink_jobmanager:/tmp/job.jar
+```
+
+## Run the Flink Job
+
+Execute the JAR inside the JobManager container:
+
+```bash
+MSYS_NO_PATHCONV=1 docker exec -it bank_flink_jobmanager flink run /tmp/job.jar
+```
+
+## Notes
+
+- Ensure the `bank_flink_jobmanager` container is running before executing these commands.
+- The Maven build must complete successfully before copying the JAR file.
+- `MSYS_NO_PATHCONV=1` is required when running the command from Git Bash on Windows.
