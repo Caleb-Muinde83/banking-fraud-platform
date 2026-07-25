@@ -1,24 +1,29 @@
 import os
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import declarative_base
+from pathlib import Path
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
-# Configure the same PostgreSQL connection parameters used by the local Docker stack and .env file
+# Load .env
+ROOT_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT_DIR / ".env")
+
+# Use standard postgresql+psycopg2 driver
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql+asyncpg://postgres_admin:SecureBankPassword2026!@localhost:5433/banking_db"
+    f"postgresql+psycopg2://{os.getenv('POSTGRES_USER', 'postgres_admin')}:{os.getenv('POSTGRES_PASSWORD', 'SecureBankPassword2026!')}@"
+    f"{os.getenv('POSTGRES_HOST', 'localhost')}:{os.getenv('POSTGRES_PORT', '5433')}/{os.getenv('POSTGRES_DB', 'banking_db')}"
 )
 
-engine = create_async_engine(DATABASE_URL, echo=False, future=True)
-
-AsyncSessionLocal = async_sessionmaker(
-    bind=engine,
-    class_=AsyncSession,
-    expire_on_commit=False
-)
-
+# Initialize standard Synchronous engine
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-async def get_db():
-    """Dependency injection yield loop for FastAPI routes."""
-    async with AsyncSessionLocal() as session:
-        yield session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

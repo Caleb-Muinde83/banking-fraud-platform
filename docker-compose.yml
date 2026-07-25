@@ -24,6 +24,32 @@ services:
       - F:/DaTech-kafka/banking-fraud-platform/persisted-volumes/postgres:/var/lib/postgresql/data
     restart: unless-stopped
 
+  # =========================
+  # Banking API Backend
+  # =========================
+  api:
+    build:
+      context: ./api      # Keeps looking for the Dockerfile in the api folder
+      dockerfile: Dockerfile
+    container_name: bank_api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - DATABASE_URL=postgresql+asyncpg://postgres_admin:SecureBankPassword2026%21@bank_postgres:5432/banking_db
+      - SCHEMA_REGISTRY_URL=http://schema-registry:8081
+      - ENABLE_DEMO_RESET=true
+      - DEMO_ADMIN_KEY=secret-demo-key-99
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_started
+      schema-registry:
+        condition: service_healthy
+    restart: unless-stopped
 
   # =========================
   # Kafka (KRaft Mode)
@@ -49,8 +75,13 @@ services:
       KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:29092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 90
+      start_period: 300s
     restart: unless-stopped
-
 
   # =========================
   # Kafka Connect (Debezium)
@@ -59,8 +90,10 @@ services:
     image: debezium/connect:2.4
     container_name: bank_connect
     depends_on:
-      - kafka
-      - postgres
+      schema-registry:
+        condition: service_healthy
+      postgres:
+        condition: service_started
     ports:
       - "8083:8083"
     environment:
@@ -72,8 +105,13 @@ services:
       CONFIG_STORAGE_REPLICATION_FACTOR: 1
       OFFSET_STORAGE_REPLICATION_FACTOR: 1
       STATUS_STORAGE_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/8083' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      start_period: 300s
     restart: unless-stopped
-
 
   # =========================
   # Schema Registry
@@ -82,13 +120,20 @@ services:
     image: confluentinc/cp-schema-registry:7.4.0
     container_name: bank_schema_registry
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     ports:
-      - "8081:8081"
+      - "18081:8081"
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/8081' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 50
+      start_period: 60s
     restart: unless-stopped
 
   # =========================
@@ -112,7 +157,7 @@ services:
         done
 
         echo 'Registering Debezium connector if missing...'
-        if curl -s -o /dev/null -w '%{http_code}' http://connect:8083/connectors/banking-cdc-connector | grep -q '^200$'; then
+        if curl -s -o /dev/null -w '%{http_code}' http://connect:8083/connectors/banking-cdc-connector | grep -q '^200$$'; then
           echo 'Connector already registered.'
           exit 0
         fi
@@ -125,7 +170,6 @@ services:
         echo 'Connector registration complete.'
     restart: "no"
 
-
   # =========================
   # Flink JobManager (UI)
   # =========================
@@ -134,15 +178,32 @@ services:
     container_name: bank_flink_jobmanager
     ports:
       - "8082:8081"
+      - "9249:9249"
     command: jobmanager
     depends_on:
-      - kafka
+      opensearch-dashboards:
+        condition: service_started
     environment:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: flink-jobmanager
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - FLINK_RISK_GROUP_ID=fraud-engine-v2
+      - KAFKA_FRAUD_ALERT_TOPIC=fraud_alerts_v2
+      - KAFKA_CRITICAL_ALERT_TOPIC=critical_alerts_v2
+      - OPENSEARCH_HOST=opensearch
+      - OPENSEARCH_PORT=9200
+      - OPENSEARCH_USER=admin
+      - OPENSEARCH_PASSWORD=admin
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/8081' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 50
+      start_period: 60s
     restart: unless-stopped
-
 
   # =========================
   # Flink TaskManager (Workers)
@@ -151,15 +212,22 @@ services:
     image: flink:1.18-scala_2.12-java11
     container_name: bank_flink_taskmanager
     depends_on:
-      - flink-jobmanager
+      flink-jobmanager:
+        condition: service_healthy
     command: taskmanager
     environment:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 2
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - OPENSEARCH_HOST=opensearch
+      - OPENSEARCH_PORT=9200
+      - OPENSEARCH_USER=admin
+      - OPENSEARCH_PASSWORD=admin
     restart: unless-stopped
-
 
   # =========================
   # Kafka Topic Bootstrapper
@@ -217,7 +285,7 @@ services:
     restart: "no"
 
   # =========================================================================
-  # Flink Fraud Engine
+  # Flink Fraud Engine Job Submitter
   # =========================================================================
   fraud-engine:
     build:
@@ -225,14 +293,26 @@ services:
       dockerfile: Dockerfile
     container_name: bank_fraud_engine
     depends_on:
-      - kafka
-      - schema-registry
+      flink-jobmanager:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       FLINK_RISK_GROUP_ID: fraud-engine-v2
       KAFKA_FRAUD_ALERT_TOPIC: fraud_alerts_v2
       KAFKA_CRITICAL_ALERT_TOPIC: critical_alerts_v2
-    restart: unless-stopped
+      FLINK_JOBMANAGER_HOST: flink-jobmanager
+      FLINK_JOBMANAGER_PORT: "8081"
+      OPENSEARCH_HOST: opensearch
+      OPENSEARCH_PORT: "9200"
+      OPENSEARCH_USER: admin
+      OPENSEARCH_PASSWORD: admin
+    restart: "no"
 
   # =========================================================================
   # OpenSearch (Search, Analytics & Threat Hunting)
@@ -240,16 +320,15 @@ services:
   opensearch:
     image: opensearchproject/opensearch:2.11.0
     container_name: bank_opensearch
+    depends_on:
+      connect:
+        condition: service_healthy
     environment:
       - cluster.name=bank-threat-hunting
       - node.name=opensearch-node1
       - discovery.type=single-node
       - bootstrap.memory_lock=true
-      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m" 
-      # DISABLE_SECURITY_PLUGIN removed — security plugin now enabled.
-      # On 2.11.0 this installs the demo config automatically with the
-      # default admin/admin credentials; no extra password env var needed
-      # (that requirement only starts at 2.12).             
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
     ulimits:
       memlock:
         soft: -1
@@ -262,6 +341,12 @@ services:
       - "9600:9600"
     volumes:
       - F:/DaTech-kafka/banking-fraud-platform/persisted-volumes/opensearch:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk -o /dev/null -w '%{http_code}' https://localhost:9200 | grep -qE '^(200|401)$$' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 300s
     restart: unless-stopped
 
   # =========================================================================
@@ -277,13 +362,9 @@ services:
       - OPENSEARCH_SSL_VERIFICATIONMODE=none
       - OPENSEARCH_USERNAME=admin
       - OPENSEARCH_PASSWORD=admin
-      # DISABLE_SECURITY_PLUGIN removed — Dashboards now shows a real login
-      # page at http://localhost:5601/app/login. Its own port stays plain
-      # HTTP by default (server.ssl.enabled is off unless set) — only the
-      # backend connection to OpenSearch needs https + verification off,
-      # since the demo certs are self-signed.
     depends_on:
-      - opensearch
+      opensearch:
+        condition: service_healthy
     restart: unless-stopped
 
   # =========================================================================
@@ -295,9 +376,12 @@ services:
       dockerfile: Dockerfile
     container_name: bank_opensearch_sink
     depends_on:
-      - kafka
-      - opensearch
-      - schema-registry
+      kafka:
+        condition: service_started
+      opensearch:
+        condition: service_healthy
+      schema-registry:
+        condition: service_started
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       OPENSEARCH_HOST: opensearch
@@ -305,4 +389,69 @@ services:
       OPENSEARCH_USER: admin
       OPENSEARCH_PASSWORD: admin
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
-    restart: unless-stopped 
+    restart: unless-stopped
+
+  # =========================================================================
+  # Prometheus Telemetry Collector
+  # =========================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: bank_prometheus
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=2d'
+      - '--storage.tsdb.retention.size=2GB'
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+    depends_on:
+      - api
+
+  # =========================================================================
+  # Grafana Visualization Server
+  # =========================================================================
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: bank_grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+    deploy:
+      resources:
+        limits:
+          cpus: '0.20'
+          memory: 256M
+    depends_on:
+      - prometheus
+
+  # =========================================================================
+  # Kafka Prometheus Exporter
+  # =========================================================================
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    container_name: bank_kafka_exporter
+    restart: always
+    ports:
+      - "9308:9308"
+    command:
+      - '--kafka.server=kafka:29092'
+    deploy:
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 128M
+    depends_on:
+      - kafka

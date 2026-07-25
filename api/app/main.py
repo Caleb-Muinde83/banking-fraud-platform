@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import uuid
 import random
 import decimal
@@ -10,16 +9,18 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Depends, HTTPException, Header
+from fastapi.responses import Response
 from pydantic import BaseModel
+
+# Prometheus Telemetry Metrics
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 # Load environment variables from repository root .env
 ROOT_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT_DIR / ".env")
 
-# Async Kafka Components
-from aiokafka import AIOKafkaProducer
+# Kafka request-logging middleware
 from app.middleware.kafka_logger import KafkaRequestLoggerMiddleware
-import app.middleware.kafka_logger as kafka_logger
 
 # SQLAlchemy Async Components
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -28,8 +29,10 @@ from sqlalchemy import select, func, text
 from sqlalchemy.dialects.postgresql import insert
 
 # Import core structural routing endpoints and domains
-from app.api import auth, accounts, transfers, employee, security, users, cards
+from app.api import auth, accounts, transfers, employee, security, users, cards, incidents, analytics, graph, demo
 import app.models.domain as models
+from app.api.incidents import router as incidents_router
+from app.api.analytics import router as analytics_router
 
 # =========================================================================
 # ASYNC DATABASE ENGINE & CONFIGURATION
@@ -79,24 +82,41 @@ app = FastAPI(
 )
 
 # =========================================================================
-# KAFKA EVENT-DRIVEN MIDDLEWARE REGISTRATION
+# PROMETHEUS METRICS DEFINITIONS & MIDDLEWARE
 # =========================================================================
+REQUEST_COUNT = Counter("banking_api_requests_total", "Total HTTP Requests", ["method", "endpoint", "status_code"])
+REQUEST_LATENCY = Histogram("banking_api_request_duration_seconds", "HTTP Request Latency in Seconds", ["endpoint"])
+
 app.add_middleware(KafkaRequestLoggerMiddleware)
 
-@app.on_event("startup")
-async def startup_kafka_producer():
-    kafka_logger.kafka_producer = AIOKafkaProducer(
-        bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092"),
-        value_serializer=lambda v: json.dumps(v).encode('utf-8')
-    )
-    await kafka_logger.kafka_producer.start()
-    print("Kafka Producer connected successfully.")
+@app.middleware("http")
+async def prometheus_metrics_middleware(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+    
+    endpoint = request.url.path
+    status_code = str(response.status_code)
+    method = request.method
 
-@app.on_event("shutdown")
-async def shutdown_kafka_producer():
-    if kafka_logger.kafka_producer:
-        await kafka_logger.kafka_producer.stop()
-        print("Kafka Producer shut down cleanly.")
+    # Normalize endpoints with path dynamic parameters to avoid metric explosions
+    if endpoint.startswith("/api/graph/entity/"):
+        endpoint = "/api/graph/entity/{id}"
+    elif endpoint.startswith("/api/accounts/") and "/balance" in endpoint:
+        endpoint = "/api/accounts/{id}/balance"
+    elif endpoint.startswith("/api/accounts/"):
+        endpoint = "/api/accounts/{id}"
+    elif endpoint.startswith("/api/sessions/"):
+        endpoint = "/api/sessions/{id}"
+
+    REQUEST_COUNT.labels(method=method, endpoint=endpoint, status_code=status_code).inc()
+    REQUEST_LATENCY.labels(endpoint=endpoint).observe(duration)
+    return response
+
+@app.get("/metrics", include_in_schema=False)
+def metrics_endpoint():
+    """Native Prometheus Scrape Target"""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 # =========================================================================
 # SYSTEM DATA SEEDING ROUTINE (COMPATIBLE WITH ASYNCPG)
@@ -165,10 +185,8 @@ async def startup_pipeline_provisioning():
                     {"id": "VIP-CFO-ACCOUNT-002", "first": "Executive", "last": "CFO"}
                 ]
                 for vip in vips:
-                    # ---> FIX: Use 'last' name to ensure unique emails for the CEO and CFO
                     vip_email = f"{vip['last'].lower()}@enterprise-vault.com"
                     
-                    # ---> OPTION 2 FIX: Check before inserting to handle persisted volumes gracefully
                     existing_vip = await db.execute(
                         select(models.Customer).where(models.Customer.customer_id == vip["id"])
                     )
@@ -202,10 +220,6 @@ class LoginPayload(BaseModel):
     device_type: Optional[str] = "DESKTOP"
     ip_address: Optional[str] = "127.0.0.1"
     country: Optional[str] = "US"
-    # NEW — geo-point support. The API just persists whatever the caller
-    # supplies (simulator, or a real client) — no geolocation logic lives
-    # here. See simulator/app/utils/generators.py for how the simulator
-    # derives these from the country it already assigns.
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
@@ -244,7 +258,6 @@ async def api_login(payload: LoginPayload, db: AsyncSession = Depends(get_db)):
     res = await db.execute(cust_stmt)
     customer = res.scalar_one_or_none()
     
-    # Auto-provision customer profile context metrics dynamically if non-existent
     if not customer:
         customer = build_provisional_customer(payload.username, payload.country, "LOW")
         db.add(customer)
@@ -266,7 +279,6 @@ async def api_login(payload: LoginPayload, db: AsyncSession = Depends(get_db)):
     )
     db.add(login_ev)
 
-    # ---> CONCURRENCY FIX: Safe PostgreSQL Upsert (Insert or Ignore) <---
     stmt = insert(models.Device).values(
         device_id=payload.device_id,
         customer_id=payload.username,
@@ -304,7 +316,6 @@ async def get_account_balance(id: str, db: AsyncSession = Depends(get_db)):
     res = await db.execute(stmt)
     account = res.scalar_one_or_none()
     if not account:
-        # Prevent FK failures by ensuring parent customer exists before the account
         cust_check = await db.execute(select(models.Customer).where(models.Customer.customer_id == "cust_unknown_fallback"))
         if not cust_check.scalar_one_or_none():
             db.add(build_provisional_customer("cust_unknown_fallback", "US", "LOW"))
@@ -323,7 +334,6 @@ async def execute_transfer(payload: TransferPayload, x_user_id: Optional[str] = 
         if not res.scalar_one_or_none():
             fallback_cust = x_user_id if acc_id == payload.from_account else "cust_external_mule"
             
-            # ---> CRITICAL FIX: Ensure dynamic customer parent exists BEFORE account creation <---
             cust_check = await db.execute(select(models.Customer).where(models.Customer.customer_id == fallback_cust))
             if not cust_check.scalar_one_or_none():
                 db.add(build_provisional_customer(fallback_cust, "UNKNOWN", "HIGH"))
@@ -339,7 +349,6 @@ async def execute_transfer(payload: TransferPayload, x_user_id: Optional[str] = 
     acc_from = from_res.scalar_one()
     acc_to = to_res.scalar_one()
 
-    # ---> MATH FIX: Use standard floats to match the SQLAlchemy Float Column type <---
     amount_float = float(payload.amount)
     
     acc_from.balance = float(acc_from.balance) - amount_float
@@ -358,8 +367,6 @@ async def execute_transfer(payload: TransferPayload, x_user_id: Optional[str] = 
 @app.post("/api/beneficiaries")
 async def add_beneficiary(payload: BeneficiaryPayload, x_user_id: Optional[str] = Header(None), db: AsyncSession = Depends(get_db)):
     b_id = str(uuid.uuid4())
-    
-    # Secure parent customer check
     req_user = x_user_id or "UNKNOWN"
     cust_check = await db.execute(select(models.Customer).where(models.Customer.customer_id == req_user))
     if not cust_check.scalar_one_or_none():
@@ -379,7 +386,6 @@ async def add_beneficiary(payload: BeneficiaryPayload, x_user_id: Optional[str] 
 async def employee_view_account(payload: EmployeeActionPayload, x_employee_id: Optional[str] = Header(None), db: AsyncSession = Depends(get_db)):
     req_emp = x_employee_id or "SYSTEM_TELLER"
     
-    # ---> CRITICAL FIX: Ensure dynamic employee parent exists BEFORE logging action <---
     emp_check = await db.execute(select(models.Employee).where(models.Employee.employee_id == req_emp))
     if not emp_check.scalar_one_or_none():
         db.add(models.Employee(
@@ -398,6 +404,7 @@ async def employee_view_account(payload: EmployeeActionPayload, x_employee_id: O
     db.add(record)
     await db.commit()
     return {"status": "AUDITED", "action_id": action_id}
+
 # =========================================================================
 # ENHANCED ATTACK AND INTERACTION EMULATION INTERFACES
 # =========================================================================
@@ -433,6 +440,10 @@ app.include_router(employee.router)
 app.include_router(security.router)
 app.include_router(users.router)  
 app.include_router(cards.router)
+app.include_router(incidents.router, prefix="/api/v1")
+app.include_router(analytics.router, prefix="/api/v1")
+app.include_router(graph.router)
+app.include_router(demo.router)
 
 @app.get("/")
 def read_root():
