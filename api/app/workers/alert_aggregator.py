@@ -42,7 +42,21 @@ AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=F
 from app.models.incidents import Incident, IncidentAlert, IncidentStatus, IncidentSeverity
 
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:29092")
-TOPIC = "fraud_alerts_v2"
+
+# REDUNDANCY: previously this consumed ONLY "fraud_alerts_v2" -- which meant
+# two things were true and neither was intentional: (1) CRITICAL-severity
+# Flink alerts on critical_alerts_v2 never became incidents at all, and
+# (2) the platform had no way to form an incident from anything other than
+# the single Flink engine. Both are fixed by subscribing to all four alert
+# topics: the "_v2" pair is the primary (Flink) engine's output, the
+# unsuffixed pair is the secondary (Python) engine's output -- see
+# analytics/kafka-stream-scripts/secondary_risk_engine.py. Aggregation below
+# is engine-agnostic: it keys on identity_key regardless of which topic (and
+# therefore which engine) an alert came from, which is what lets an incident
+# be corroborated by either engine, or continue forming even if one engine
+# is completely down.
+ALERT_TOPICS = ["fraud_alerts_v2", "critical_alerts_v2", "fraud_alerts", "critical_alerts"]
+PRIMARY_TOPICS = {"fraud_alerts_v2", "critical_alerts_v2"}
 WINDOW_MINUTES = 30
 
 SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://localhost:18081")
@@ -72,12 +86,35 @@ def decode_message(msg_value: bytes) -> dict:
         return json.loads(msg_value.decode("utf-8"))
 
 
-async def process_alert(alert_data: dict, db: AsyncSession):
+async def process_alert(alert_data: dict, db: AsyncSession, source_topic: str):
     """Core logic to deduplicate alerts into Incidents"""
     identity_key = alert_data.get("customer_id") or alert_data.get("account_id") or "UNKNOWN"
     alert_id = alert_data.get("alert_id", f"alt_{int(datetime.now().timestamp())}")
-    risk_score = float(alert_data.get("risk_score", 50.0))
-    indicator = alert_data.get("rule_name", "ANOMALY_DETECTED")
+
+    # BUGFIX: this previously read "risk_score" / "rule_name", but the Flink
+    # engine's actual wire fields (FraudAlertAvroSerializationSchema.java) are
+    # "cumulative_score" / "trigger_reason" / "contributing_indicators" --
+    # meaning every real Flink alert was silently falling through to the
+    # 50.0 / "ANOMALY_DETECTED" defaults below, and every incident from the
+    # primary engine was landing at MEDIUM severity regardless of its real
+    # score. Both field names are now accepted so payloads from either engine
+    # (which share this exact field naming by design -- see
+    # secondary_risk_engine.py) resolve correctly.
+    risk_score = float(alert_data.get("cumulative_score", alert_data.get("risk_score", 50.0)))
+    indicator = (
+        alert_data.get("trigger_reason")
+        or alert_data.get("rule_name")
+        or (alert_data.get("contributing_indicators") or [None])[-1]
+        or "ANOMALY_DETECTED"
+    )
+
+    # REDUNDANCY: tag which engine produced this alert. Explicit engine_source
+    # field (secondary_risk_engine.py sets this) wins; otherwise infer from
+    # which topic it arrived on.
+    engine_source = alert_data.get("engine_source") or (
+        "flink-primary" if source_topic in PRIMARY_TOPICS else "python-secondary"
+    )
+    alert_data = {**alert_data, "engine_source": engine_source, "_source_topic": source_topic}
     
     # 1. Look for an OPEN/INVESTIGATING incident for this identity in the last 30 minutes
     cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=WINDOW_MINUTES)
@@ -92,7 +129,14 @@ async def process_alert(alert_data: dict, db: AsyncSession):
 
     if incident:
         # 2a. Update existing incident
-        print(f"🔄 Bundling alert {alert_id} into existing Incident {incident.id}")
+        prior_sources = set(incident.engine_sources or [])
+        newly_corroborated = engine_source not in prior_sources and len(prior_sources) >= 1
+        incident.engine_sources = sorted(prior_sources | {engine_source})
+        incident.corroborated = len(incident.engine_sources) > 1
+
+        tag = " (now corroborated by a second engine)" if newly_corroborated else ""
+        print(f"🔄 Bundling alert {alert_id} [{engine_source}] into existing Incident {incident.id}{tag}")
+
         incident.alert_count += 1
         incident.max_risk_score = max(incident.max_risk_score, risk_score)
         incident.last_alert_at = datetime.now(timezone.utc)
@@ -105,7 +149,7 @@ async def process_alert(alert_data: dict, db: AsyncSession):
             
     else:
         # 2b. Create brand new incident
-        print(f"🚨 Creating NEW Incident for identity: {identity_key}")
+        print(f"🚨 Creating NEW Incident for identity: {identity_key} (first seen by {engine_source})")
         severity = IncidentSeverity.MEDIUM
         if risk_score >= 90: severity = IncidentSeverity.CRITICAL
         elif risk_score >= 70: severity = IncidentSeverity.HIGH
@@ -116,6 +160,8 @@ async def process_alert(alert_data: dict, db: AsyncSession):
             status=IncidentStatus.OPEN,
             severity=severity,
             alert_count=1,
+            engine_sources=[engine_source],
+            corroborated=False,
             max_risk_score=risk_score,
             first_alert_at=datetime.now(timezone.utc),
             last_alert_at=datetime.now(timezone.utc)
@@ -129,7 +175,7 @@ async def process_alert(alert_data: dict, db: AsyncSession):
         alert_id=alert_id,
         indicator=indicator,
         risk_score=risk_score,
-        source_topic=TOPIC,
+        source_topic=source_topic,
         raw_payload=alert_data,
         received_at=datetime.now(timezone.utc)
     )
@@ -138,9 +184,9 @@ async def process_alert(alert_data: dict, db: AsyncSession):
 
 
 async def consume():
-    print(f"🎧 Starting Alert Aggregator Worker... listening to {TOPIC} on {KAFKA_BROKER}")
+    print(f"🎧 Starting Alert Aggregator Worker... listening to {ALERT_TOPICS} on {KAFKA_BROKER}")
     consumer = AIOKafkaConsumer(
-        TOPIC,
+        *ALERT_TOPICS,
         bootstrap_servers=KAFKA_BROKER,
         group_id="fraud_incident_aggregator",
         auto_offset_reset="earliest"
@@ -150,14 +196,15 @@ async def consume():
     try:
         async for msg in consumer:
             try:
-                # Use our new smart decoder!
+                # Use our new smart decoder! (handles both engines' output --
+                # Avro from Flink, plain JSON from the secondary engine)
                 alert_data = decode_message(msg.value)
                 
                 async with AsyncSessionLocal() as db:
-                    await process_alert(alert_data, db)
+                    await process_alert(alert_data, db, source_topic=msg.topic)
                     
             except Exception as e:
-                print(f"❌ Error processing message: {e}")
+                print(f"❌ Error processing message from {msg.topic}: {e}")
     finally:
         await consumer.stop()
 

@@ -1,0 +1,151 @@
+{
+  "id": null,
+  "uid": "cluster-resource-usage",
+  "title": "Cluster Resource Usage",
+  "tags": [
+    "banking-fraud-platform",
+    "resources",
+    "cadvisor",
+    "node-exporter"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Host-level (node-exporter)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Host CPU Usage (%)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100)",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Host Memory Used (%)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Host Disk I/O (bytes/sec)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "expr": "rate(node_disk_read_bytes_total[1m])",
+          "legendFormat": "read {{device}}"
+        },
+        {
+          "expr": "rate(node_disk_written_bytes_total[1m])",
+          "legendFormat": "write {{device}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Host Network I/O (bytes/sec)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "targets": [
+        {
+          "expr": "rate(node_network_receive_bytes_total{device!~\"lo\"}[1m])",
+          "legendFormat": "rx {{device}}"
+        },
+        {
+          "expr": "rate(node_network_transmit_bytes_total{device!~\"lo\"}[1m])",
+          "legendFormat": "tx {{device}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "text",
+      "title": "Per-Container (cAdvisor) \u2014 currently unavailable",
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**cAdvisor is running and collecting metrics, but cannot resolve container names on this host.**\n\n`container_cpu_usage_seconds_total` / `container_memory_usage_bytes` are present, but every real container entry carries only a raw cgroup `id` (e.g. `/docker/058a68...`) with no `name` or `container_label_*` labels attached \u2014 cAdvisor's Docker-container-factory name resolution isn't registering under this Docker Desktop / WSL2 setup, even with `/var/run/docker.sock` mounted and `privileged: true` set. Diagnosed directly against this deployment (not a generic caveat) on 2026-07-29.\n\nPer-container panels were removed rather than left showing unusable raw hashes that change on every container recreate. **Host-level metrics above (node-exporter) remain fully functional** and are the primary resource-usage signal for this single-host stack. If this moves to a native Linux host, re-add the four per-container panels \u2014 cAdvisor's Docker integration is expected to work normally there."
+      }
+    }
+  ]
+}

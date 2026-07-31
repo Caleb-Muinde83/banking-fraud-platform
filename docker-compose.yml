@@ -315,6 +315,78 @@ services:
     restart: "no"
 
   # =========================================================================
+  # Secondary Risk Engine (Python) -- ACTIVE-ACTIVE redundancy for fraud-engine
+  # -------------------------------------------------------------------------
+  # Runs continuously alongside the Flink engine above (not just when it's
+  # down), consuming the same raw topics independently and emitting to the
+  # fraud_alerts / critical_alerts topics (provisioned since day one by
+  # kafka-init, previously never written to by anything). The Alert
+  # Aggregator consumes from both engines' output topics and bundles by
+  # identity, so an incident keeps forming from whichever engine is up.
+  # See analytics/kafka-stream-scripts/secondary_risk_engine.py.
+  # =========================================================================
+  fraud-engine-secondary:
+    build:
+      context: .
+      dockerfile: analytics/kafka-stream-scripts/Dockerfile
+    container_name: bank_fraud_engine_secondary
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      SECONDARY_ENGINE_GROUP_ID: fraud-engine-secondary-v1
+      SECONDARY_ENGINE_METRICS_PORT: "9500"
+      SECONDARY_FRAUD_TOPIC: fraud_alerts
+      SECONDARY_CRITICAL_TOPIC: critical_alerts
+      API_REQUEST_SCHEMA_PATH: /app/config/schemas/api_request.avsc
+    ports:
+      - "9500:9500"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 384M
+    restart: unless-stopped
+
+  # =========================================================================
+  # Fraud Engine Watchdog -- redundancy/liveness observability
+  # -------------------------------------------------------------------------
+  # Polls both risk-scoring engines and exposes fraud_engine_primary_up /
+  # fraud_engine_secondary_up / fraud_engine_redundancy_status to Prometheus.
+  # Does not perform failover (both engines already run all the time) --
+  # this is purely "can an operator see, at a glance, whether fraud scoring
+  # currently has its full redundancy or is running on one engine alone."
+  # See analytics/engine-watchdog/watchdog.py.
+  # =========================================================================
+  fraud-engine-watchdog:
+    build:
+      context: ./analytics/engine-watchdog
+      dockerfile: Dockerfile
+    container_name: bank_fraud_engine_watchdog
+    depends_on:
+      - flink-jobmanager
+      - fraud-engine-secondary
+    environment:
+      FLINK_JOBMANAGER_URL: http://flink-jobmanager:8081
+      SECONDARY_ENGINE_METRICS_URL: http://fraud-engine-secondary:9500/metrics
+      WATCHDOG_METRICS_PORT: "9600"
+      WATCHDOG_INTERVAL_SEC: "15"
+    ports:
+      - "9601:9600"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 64M
+    restart: unless-stopped
+
+  # =========================================================================
   # OpenSearch (Search, Analytics & Threat Hunting)
   # =========================================================================
   opensearch:
@@ -429,6 +501,12 @@ services:
     volumes:
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      # BUGFIX: grafana/provisioning/dashboards/dashboards.yml has always
+      # pointed its file provider at /var/lib/grafana/dashboards, but nothing
+      # mounted anything there -- so no dashboard JSON was ever auto-loaded.
+      # This adds the actual dashboard files (cluster resource usage, fraud
+      # engine redundancy) so they appear in Grafana on first boot.
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
     deploy:
       resources:
         limits:
@@ -436,6 +514,74 @@ services:
           memory: 256M
     depends_on:
       - prometheus
+
+  # =========================================================================
+  # cAdvisor -- per-container CPU / memory / network / disk-IO metrics
+  # -------------------------------------------------------------------------
+  # Gives Prometheus/Grafana visibility into resource usage for every
+  # container in this stack individually (e.g. "is flink-taskmanager near
+  # its memory limit", "which service is driving CPU right now"), which
+  # nothing in the platform previously collected -- only application-level
+  # metrics (request latency, consumer lag) were exposed, not the underlying
+  # container resource consumption those applications are running on top of.
+  # =========================================================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    container_name: bank_cadvisor
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "8085:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+    deploy:
+      resources:
+        limits:
+          cpus: '0.20'
+          memory: 200M
+    # NOTE: cAdvisor's standard Linux recipe also mounts /dev/kmsg and runs
+    # privileged; both are omitted here because this stack's own volume
+    # paths (see postgres, above) indicate a Windows/Docker Desktop host,
+    # where /dev/kmsg isn't available the same way. On a native Linux host,
+    # re-add `devices: ["/dev/kmsg"]` and `privileged: true` for full
+    # coverage (event/oom metrics); container CPU/memory/network metrics
+    # work correctly without them either way.
+
+  # =========================================================================
+  # node-exporter -- host-level CPU / memory / disk / network metrics
+  # -------------------------------------------------------------------------
+  # Complements cAdvisor: cAdvisor answers "what is each container using",
+  # node-exporter answers "what is the underlying host using in total"
+  # (including resources outside any container's cgroup). Together they're
+  # what "resource usage across the cluster" means in the Grafana dashboard
+  # this compose file also provisions (grafana/dashboards/cluster-resource-usage.json).
+  # =========================================================================
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    container_name: bank_node_exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    deploy:
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 128M
 
   # =========================================================================
   # Kafka Prometheus Exporter

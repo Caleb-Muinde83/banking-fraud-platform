@@ -66,72 +66,102 @@ The architecture uses a dual-path telemetry and data pipeline:
 
 ### 2.2 End-to-End Architecture Diagram
 
-# End-to-End Banking Fraud Platform Architecture
+flowchart TB
+    SIM["Simulator<br/>20 persona-driven customer actors + 2 employee actors<br/>+ 15 named attack scenarios (scenarios.py)"]
 
-```text
-┌──────────────────────────┐
-│    Simulator / Users     │
-└────────────┬─────────────┘
-             │
-             ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                                 FastAPI Gateway (API)                                   │
-│                                                                                         │
-│ • Core Banking Endpoints (/transfers, /accounts, /auth)                                 │
-│ • SOC Gateway (/incidents, /graph, /cards)                                              │
-│ • Middleware: Kafka Logger (HTTP Telemetry) & Prometheus Metrics Exporter               │
-└──────┬──────────────────────────┬─────────────────────────────────▲─────────────────────┘
-       │                          │                                 │
-       │ Database Mutations       │ Telemetry Logs (Avro)           │ SOC Incident
-       ▼                          ▼                                 │ Triage & Locks
-┌──────────────┐          ┌──────────────────────────────────┐      │
-│ PostgreSQL   │          │     Schema Registry (8081)       │      │
-│ (wal_level=  │          │ • Avro Schemas (.avsc)           │      │
-│  logical)    │          └──────────────┬───────────────────┘      │
-└──────┬───────┘                         │ Schemas                  │
-       │                                 ▼                          │
-       │ WAL Stream          ┌──────────────────────────────────────┴────────────────────┐
-       ▼                     │              Kafka Broker (KRaft)                         │
-┌────────────────────────┐   │                                                           │
-│ Debezium Kafka Connect │──▶│ • Telemetry Topics (api_requests)                        │
-│ (postgres-source)      │   │ • CDC Topics (banking.accounts, banking.transactions)     │
-└────────────────────────┘   │ • Alert Topics (fraud_alerts_v2, critical_alerts_v2)      │
-                             └─────────▲──────────────────────┬──────────────────────────┘
-                                       │                      │
-      ┌────────────────────────────────┼──────────────────────┤
-      │ Emits Alerts                   │ Consumes Events      │ Consumes Telemetry
-      │                                ▼                      ▼
-┌─────┴────────────────────────────────────────┐   ┌──────────────────────────────────────┐
-│ Apache Flink Analytics Cluster               │   │ Python Kafka Stream Scripts          │
-│                                              │   │ (analytics/kafka-stream-scripts/)    │
-│ analytics/apache-flink-scripts/              │   │                                      │
-│ analytics/flink-risk-engine-java/            │   │ 1. rules_engine.py                   │
-│                                              │   │    • Dynamic policy evaluation       │
-│ 1. flink_risk_engine.py / Java Engine        │   │    • Low-latency anomaly detection   │
-│    • Keyed stateful window scoring           │   │                                      │
-│    • Account CDC stateful joins              │   │ 2. risk_scoring_engine.py            │
-│    • Cooldown & alert suppression            │   │    • Lightweight stateless/sliding   │
-│                                              │   │      risk evaluation                 │
-│ 2. flink_cep_engine.py                       │   └──────────────┬───────────────────────┘
-│    • Complex Event Processing (CEP)          │                  │
-│    • Multi-stage attack detection            │                  │ Emits anomaly signals
-└────────────────┬─────────────────────────────┘                  │
-                 │ Async lookups                                 │
-                 ▼                                               │
-┌────────────────────────────────────────────────────────────────┼─────────────────────────┐
-│                    OpenSearch & Dashboards                     │                         │
-│                                                                │◀───────────────────────┘
-│ • Indices: api_requests, fraud_alerts, banking_logs            │
-│ • Visual dashboards & threat hunting UI (Port 5601)            │
-└──────────────────────────────────────▲─────────────────────────┘
-                                       │ Bulk Indexing
-                           ┌───────────┴────────────────────────┐
-                           │ OpenSearch Ingestion Sink Daemon   │
-                           │ (analytics/opensearch/)            │
-                           └───────────▲────────────────────────┘
-                                       │ Consumes telemetry & alert topics
-                                       └─────────────── From Kafka
-```
+    subgraph API["FastAPI Gateway (api/)"]
+        ROUTES["Core Banking: /api/auth, /api/accounts, /api/transfers, /api/cards<br/>SOC Gateway: /api/v1/incidents, /api/graph, /api/v1/analytics"]
+        MW["Middleware: KafkaRequestLoggerMiddleware (Avro telemetry, fire-and-forget)<br/>+ Prometheus metrics middleware"]
+    end
+
+    PG[("PostgreSQL 15<br/>wal_level=logical")]
+    SR["Schema Registry :8081<br/>Avro schemas (.avsc)"]
+
+    subgraph DBZ["Debezium / Kafka Connect"]
+        CDC["postgres-banking-cdc connector<br/>table.include.list:<br/>login_events, sessions, accounts,<br/>transactions, beneficiaries, employee_actions"]
+    end
+
+    subgraph KAFKA["Kafka Broker (KRaft)"]
+        T1["api_requests / dead_letter_queue"]
+        T2["banking.login_events, banking.sessions,<br/>banking.accounts, banking.transactions,<br/>banking.beneficiaries, banking.employee_actions"]
+        T3["fraud_alerts_v2 / critical_alerts_v2"]
+    end
+
+    subgraph FLINK["Apache Flink Risk Engine (Java) — the only LIVE scoring engine"]
+        NORM["RiskEventNormalizer + AccountEventNormalizer"]
+        ENRICH["AccountEnrichmentFunction<br/>(broadcast join: account_id → customer_id)"]
+        OSLOOKUP["OpenSearchLookupFunction<br/>(async I/O, fail-open, 100 in-flight cap)"]
+        PROC["RiskScoringProcessor<br/>keyed RocksDB state, decay, cooldown,<br/>indicator taxonomy → cumulative score"]
+        NORM --> ENRICH --> OSLOOKUP --> PROC
+    end
+
+    subgraph GRAPH["Graph Analytics (api/app/services/)"]
+        GB["GraphBuilderService<br/>NetworkX MultiDiGraph from Postgres"]
+        RD["RingDetectorService<br/>simple_cycles + shared-infra clustering"]
+        GB --> RD
+    end
+
+    AGG["Alert Aggregator worker<br/>(api/app/workers/alert_aggregator.py)<br/>dedups alerts → Incident / IncidentAlert rows"]
+
+    subgraph OS["OpenSearch"]
+        IDX["Indices: api_requests, login_events,<br/>employee_actions, alerts (fraud+critical merged)"]
+        DASH["OpenSearch Dashboards :5601"]
+    end
+
+    SINK["OpenSearch Sink daemon<br/>(analytics/opensearch/) — one thread per topic"]
+
+    subgraph OBS["Observability"]
+        PROM["Prometheus"]
+        GRAF["Grafana"]
+        KEXP["kafka-exporter"]
+    end
+
+    SOC["SOC Analyst<br/>via /api/v1/incidents and /api/graph"]
+
+    %% Flow
+    SIM -->|HTTP| ROUTES
+    ROUTES --> MW
+    MW -->|SQL writes, asyncpg| PG
+    MW -->|Avro telemetry| T1
+    SR -.->|schema contracts| T1
+    SR -.->|schema contracts| T3
+
+    PG -->|WAL logical replication| CDC
+    CDC --> T2
+
+    T2 --> NORM
+    T1 --> NORM
+    T3 -.->|env schema config only| FLINK
+
+    PROC -->|FRAUD severity| T3
+    PROC -->|CRITICAL severity| T3
+
+    T3 --> AGG
+    AGG -->|writes| PG
+    PG -.->|queried on demand| GB
+    ROUTES -->|GET /api/graph/*| GB
+    RD -->|FraudRingAlert| ROUTES
+
+    T1 --> SINK
+    T2 --> SINK
+    T3 --> SINK
+    SINK --> IDX
+    IDX --> DASH
+
+    ROUTES <-->|list/assign/resolve incidents| SOC
+    DASH -->|threat hunting| SOC
+
+    ROUTES -.->|/metrics| PROM
+    FLINK -.->|Prometheus reporter :9249| PROM
+    KAFKA -.->|kafka-exporter :9308| PROM
+    PROM --> GRAF
+
+    classDef live fill:#1f6f43,color:#fff,stroke:#0d3d24
+    classDef infra fill:#2c3e50,color:#fff,stroke:#111
+    classDef store fill:#34495e,color:#fff,stroke:#111
+    class FLINK,GRAPH,AGG,SINK live
+    class API,DBZ,KAFKA,OS,OBS infra
+    class PG,SR store
 
 ---
 
@@ -1518,3 +1548,4 @@ Submit bug reports or feature requests through the GitHub issue tracker:
 ```text
 https://github.com/DatechCommunity
 ```
+

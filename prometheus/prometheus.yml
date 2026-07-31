@@ -15,3 +15,21 @@ scrape_configs:
   - job_name: 'kafka-exporter'
     static_configs:
       - targets: ['bank_kafka_exporter:9308']
+
+  # --- Fraud engine redundancy (secondary Python engine + watchdog) ---
+  - job_name: 'fraud-engine-secondary'
+    static_configs:
+      - targets: ['bank_fraud_engine_secondary:9500']
+
+  - job_name: 'fraud-engine-watchdog'
+    static_configs:
+      - targets: ['bank_fraud_engine_watchdog:9600']
+
+  # --- Cluster-wide resource usage ---
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['bank_cadvisor:8080']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['bank_node_exporter:9100']
