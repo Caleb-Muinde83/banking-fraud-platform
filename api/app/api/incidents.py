@@ -23,6 +23,9 @@ async def list_incidents(
     status_filter: Optional[IncidentStatus] = Query(None, alias="status"),
     severity_filter: Optional[IncidentSeverity] = Query(None, alias="severity"),
     identity_key: Optional[str] = Query(None),
+    corroborated: Optional[bool] = Query(
+        None, description="Filter to incidents confirmed by both the primary and secondary risk engines"
+    ),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db)
@@ -38,6 +41,8 @@ async def list_incidents(
         stmt = stmt.where(Incident.severity == severity_filter)
     if identity_key:
         stmt = stmt.where(Incident.identity_key == identity_key)
+    if corroborated is not None:
+        stmt = stmt.where(Incident.corroborated == corroborated)
 
     stmt = stmt.order_by(desc(Incident.updated_at)).offset(offset).limit(limit)
     

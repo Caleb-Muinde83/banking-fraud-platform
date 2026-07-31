@@ -1,0 +1,121 @@
+flowchart TB
+    SIM["Simulator<br/>20 persona-driven customer actors + 2 employee actors<br/>+ 15 named attack scenarios (scenarios.py)"]
+
+    subgraph API["FastAPI Gateway (api/)"]
+        ROUTES["Core Banking: /api/auth, /api/accounts, /api/transfers, /api/cards<br/>SOC Gateway: /api/v1/incidents, /api/graph, /api/v1/analytics"]
+        MW["Middleware: KafkaRequestLoggerMiddleware (Avro telemetry, fire-and-forget)<br/>+ Prometheus metrics middleware"]
+    end
+
+    PG[("PostgreSQL 15<br/>wal_level=logical")]
+    SR["Schema Registry :8081<br/>Avro schemas (.avsc)"]
+
+    subgraph DBZ["Debezium / Kafka Connect"]
+        CDC["postgres-banking-cdc connector<br/>table.include.list:<br/>login_events, sessions, accounts,<br/>transactions, beneficiaries, employee_actions"]
+    end
+
+    subgraph KAFKA["Kafka Broker (KRaft)"]
+        T1["api_requests / dead_letter_queue"]
+        T2["banking.login_events, banking.sessions,<br/>banking.accounts, banking.transactions,<br/>banking.beneficiaries, banking.employee_actions"]
+        T3["fraud_alerts_v2 / critical_alerts_v2<br/>(primary/Flink output)"]
+        T4["fraud_alerts / critical_alerts<br/>(secondary/Python output — repurposed,<br/>previously provisioned but unused)"]
+    end
+
+    subgraph FLINK["Apache Flink Risk Engine (Java) — PRIMARY scoring engine"]
+        NORM["RiskEventNormalizer + AccountEventNormalizer"]
+        ENRICH["AccountEnrichmentFunction<br/>(broadcast join: account_id → customer_id)"]
+        OSLOOKUP["OpenSearchLookupFunction<br/>(async I/O, fail-open, 100 in-flight cap)"]
+        PROC["RiskScoringProcessor<br/>keyed RocksDB state, decay, cooldown,<br/>indicator taxonomy → cumulative score"]
+        NORM --> ENRICH --> OSLOOKUP --> PROC
+    end
+
+    subgraph SECONDARY["Secondary Risk Engine (Python) — SECONDARY, active-active"]
+        SNORM["Per-topic consumer threads<br/>(mirrors opensearch_sink's starvation fix)"]
+        SPROC["In-memory identity state<br/>same indicator taxonomy & thresholds<br/>as RiskScoringProcessor"]
+        SNORM --> SPROC
+    end
+
+    WATCHDOG["Fraud Engine Watchdog<br/>polls Flink JobManager + secondary /metrics<br/>→ fraud_engine_redundancy_status<br/>host: 9601 → container: 9600<br/>(9600 was already OpenSearch's perf-analyzer port)"]
+
+    subgraph GRAPH["Graph Analytics (api/app/services/)"]
+        GB["GraphBuilderService<br/>NetworkX MultiDiGraph from Postgres"]
+        RD["RingDetectorService<br/>simple_cycles + shared-infra clustering"]
+        GB --> RD
+    end
+
+    AGG["Alert Aggregator worker<br/>(api/app/workers/alert_aggregator.py)<br/>dedups alerts → Incident / IncidentAlert rows"]
+
+    subgraph OS["OpenSearch"]
+        IDX["Indices: api_requests, login_events,<br/>employee_actions, alerts (fraud+critical merged)"]
+        DASH["OpenSearch Dashboards :5601"]
+    end
+
+    SINK["OpenSearch Sink daemon<br/>(analytics/opensearch/) — one thread per topic"]
+
+    subgraph OBS["Observability"]
+        PROM["Prometheus"]
+        GRAF["Grafana<br/>(cluster-resource-usage +<br/>fraud-engine-redundancy dashboards)"]
+        KEXP["kafka-exporter"]
+        CADV["cAdvisor<br/>host-level cgroup metrics only —<br/>per-container name resolution confirmed<br/>non-functional under Docker Desktop/WSL2<br/>(panels removed from dashboard)"]
+        NEXP["node-exporter<br/>(host-level resource usage)"]
+    end
+
+    SOC["SOC Analyst<br/>via /api/v1/incidents and /api/graph"]
+
+    %% Flow
+    SIM -->|HTTP| ROUTES
+    ROUTES --> MW
+    MW -->|SQL writes, asyncpg| PG
+    MW -->|Avro telemetry| T1
+    SR -.->|schema contracts| T1
+    SR -.->|schema contracts| T3
+
+    PG -->|WAL logical replication| CDC
+    CDC --> T2
+
+    T2 --> NORM
+    T1 --> NORM
+    T3 -.->|env schema config only| FLINK
+
+    PROC -->|FRAUD severity| T3
+    PROC -->|CRITICAL severity| T3
+
+    T1 --> SNORM
+    T2 --> SNORM
+    SPROC -->|FRAUD severity| T4
+    SPROC -->|CRITICAL severity| T4
+
+    WATCHDOG -.->|poll flink-jobmanager:8081/jobs| FLINK
+    WATCHDOG -.->|poll fraud-engine-secondary:9500/metrics| SECONDARY
+
+    T3 --> AGG
+    T4 -->|"engine_source: python-secondary"| AGG
+    AGG -->|writes| PG
+    PG -.->|queried on demand| GB
+    ROUTES -->|GET /api/graph/*| GB
+    RD -->|FraudRingAlert| ROUTES
+
+    T1 --> SINK
+    T2 --> SINK
+    T3 --> SINK
+    T4 --> SINK
+    SINK --> IDX
+    IDX --> DASH
+
+    ROUTES <-->|list/assign/resolve incidents| SOC
+    DASH -->|threat hunting| SOC
+
+    ROUTES -.->|/metrics| PROM
+    FLINK -.->|Prometheus reporter :9249| PROM
+    SECONDARY -.->|/metrics :9500| PROM
+    WATCHDOG -.->|/metrics :9600, container-internal| PROM
+    KAFKA -.->|kafka-exporter :9308| PROM
+    CADV -.->|:8080| PROM
+    NEXP -.->|:9100| PROM
+    PROM --> GRAF
+
+    classDef live fill:#1f6f43,color:#fff,stroke:#0d3d24
+    classDef infra fill:#2c3e50,color:#fff,stroke:#111
+    classDef store fill:#34495e,color:#fff,stroke:#111
+    class FLINK,SECONDARY,WATCHDOG,GRAPH,AGG,SINK live
+    class API,DBZ,KAFKA,OS,OBS infra
+    class PG,SR store

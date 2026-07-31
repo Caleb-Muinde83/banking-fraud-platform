@@ -1,0 +1,106 @@
+{
+  "id": null,
+  "uid": "fraud-engine-redundancy",
+  "title": "Fraud Engine Redundancy",
+  "tags": ["banking-fraud-platform", "redundancy", "fraud-engine"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Primary (Flink) Engine",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "fraud_engine_primary_up" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "value": 0, "color": "red" }, { "value": 1, "color": "green" }] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Secondary (Python) Engine",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "targets": [{ "expr": "fraud_engine_secondary_up" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "value": 0, "color": "red" }, { "value": 1, "color": "green" }] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Redundancy Status",
+      "description": "0 = BOTH DOWN (page someone) | 1 = secondary-only | 2 = primary-only | 3 = both up (normal)",
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 0 },
+      "targets": [{ "expr": "fraud_engine_redundancy_status" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": {
+              "0": { "text": "BOTH ENGINES DOWN", "color": "red" },
+              "1": { "text": "SECONDARY ONLY", "color": "orange" },
+              "2": { "text": "PRIMARY ONLY", "color": "orange" },
+              "3": { "text": "BOTH UP (normal)", "color": "green" }
+            } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [
+            { "value": 0, "color": "red" },
+            { "value": 1, "color": "orange" },
+            { "value": 3, "color": "green" }
+          ] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Redundancy Status Over Time",
+      "description": "A dip below 3 for any length of time means the platform was briefly running on a single engine. Sustained 0 means no fraud scoring was happening at all -- this is the panel to alert on.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 5 },
+      "targets": [{ "expr": "fraud_engine_redundancy_status", "legendFormat": "redundancy status" }],
+      "fieldConfig": { "defaults": { "min": 0, "max": 3 }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Alerts Emitted by Secondary Engine",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "targets": [
+        { "expr": "rate(secondary_engine_alerts_emitted_total[5m])", "legendFormat": "{{severity}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Events Processed by Secondary Engine (by topic)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "targets": [
+        { "expr": "rate(secondary_engine_events_processed_total[5m])", "legendFormat": "{{topic}}" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Identities Tracked in Secondary Engine's In-Memory State",
+      "description": "Unlike the Flink engine's RocksDB-backed state, this engine's state lives in a plain dict and is lost on restart -- a sudden drop to zero here (outside a deliberate restart) is worth investigating.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 21 },
+      "targets": [{ "expr": "secondary_engine_identities_tracked" }]
+    }
+  ]
+}
