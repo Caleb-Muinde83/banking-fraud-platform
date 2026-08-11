@@ -1,6 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+# UPDATED: check POSTGRES_PASSWORD_FILE first, matching the official
+# Postgres image's own convention -- this is what lets the Swarm compose
+# file pass the password via a mounted secret (/run/secrets/postgres_password)
+# instead of a plaintext environment variable. Falls back to POSTGRES_PASSWORD
+# directly if no _FILE variant is set, so this script still works unmodified
+# against the single-host docker-compose.yml, which doesn't use secrets.
+if [ -n "${POSTGRES_PASSWORD_FILE:-}" ] && [ -f "${POSTGRES_PASSWORD_FILE}" ]; then
+  POSTGRES_PASSWORD="$(cat "${POSTGRES_PASSWORD_FILE}")"
+fi
+
 TARGET_ROLE="${POSTGRES_USER:-postgres}"
 TARGET_PASSWORD="${POSTGRES_PASSWORD:-postgres}"
 TARGET_DB="${POSTGRES_DB:-postgres}"

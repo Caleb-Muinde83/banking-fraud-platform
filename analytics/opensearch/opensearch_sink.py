@@ -34,18 +34,40 @@ AUTH = (
 # Added "banking.employee_actions" -> "employee_actions" to unblock
 # Phase 4 Insider Threat Hunting queries. Confirmed this topic is real:
 # public.employee_actions is in Debezium's table.include.list already.
+#
+# REDUNDANCY FIX: "fraud_alerts"/"critical_alerts" (the secondary Python
+# engine's output — see analytics/kafka-stream-scripts/secondary_risk_engine.py)
+# were never added here when that engine was introduced. Those alerts were
+# still reaching Postgres correctly via alert_aggregator.py (which subscribes
+# to all four alert topics directly), so incidents were forming fine — but
+# they were never reaching OpenSearch, so they were invisible to threat-
+# hunting queries against the "alerts" index. Same target index as the
+# primary engine's topics for the same reason noted above: `severity` and
+# the new `engine_source` field on every alert payload are enough to
+# distinguish them at query time, so there's no need for separate indices.
 TOPIC_INDEX_MAP = {
     "api_requests": "api_requests",
     "banking.login_events": "login_events",
     "banking.employee_actions": "employee_actions",
     "fraud_alerts_v2": "alerts",
     "critical_alerts_v2": "alerts",
+    "fraud_alerts": "alerts",
+    "critical_alerts": "alerts",
 }
 
 # FIXED: Added "api_requests" to AVRO_TOPICS. The API's telemetry middleware
 # transmits these events using Confluent's AvroSerializer, wrapping the message 
 # payload in binary format rather than raw JSON strings. Adding it here directs 
 # the deserializer to parse the Confluent wire-format schema bytes correctly.
+#
+# NOTE: "fraud_alerts"/"critical_alerts" are deliberately NOT in this set.
+# Unlike fraud_alerts_v2/critical_alerts_v2 (Flink, via
+# FraudAlertAvroSerializationSchema -> Confluent Avro wire format), the
+# secondary engine publishes plain json.dumps() bytes with no Avro envelope
+# — see secondary_risk_engine.py's _maybe_alert(). Routing them through
+# AvroDeserializer would fail immediately on the missing magic byte.
+# deserialize_message()'s default branch (plain json.loads) is already
+# correct for them without any change there.
 AVRO_TOPICS = {"fraud_alerts_v2", "critical_alerts_v2", "api_requests"}
 
 # CHANGED: CDC topics need their Debezium envelope ({before, after, source,

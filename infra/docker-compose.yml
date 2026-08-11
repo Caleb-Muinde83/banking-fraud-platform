@@ -1,5 +1,45 @@
 version: "3.8"
 
+# =============================================================================
+# UPDATED TO MATCH docker-compose.yml (single-host dev stack) — see the
+# bottom of this file for a full changelog of what was added, and three
+# Swarm-specific corrections that are NOT just mechanical ports:
+#
+#   1. Every bind-mounted config file in the single-host version (prometheus.yml,
+#      grafana's provisioning YAMLs, the two Grafana dashboard JSONs, the
+#      Debezium connector JSON) is converted to a Swarm `configs:` object
+#      instead of a bind mount. A relative bind mount (`./prometheus.yml:...`)
+#      only works if that exact host path exists on whichever node Swarm
+#      happens to schedule the container onto -- which you can't guarantee
+#      across k3s-master / k3s-worker-2 / k3s-worker-3. This is the exact
+#      same reason postgres's own init script is already baked into the
+#      custom image rather than bind-mounted (see the original comment on
+#      the postgres service, preserved below) -- this update just applies
+#      that same already-established principle consistently to every new
+#      service, rather than reintroducing the bug five more times.
+#
+#   2. cadvisor and node-exporter use `deploy.mode: global` (one task per
+#      node, automatically) instead of being pinned to a single node like
+#      every other service here. Pinning them to one node -- the naive
+#      "just copy the single-host version" move -- would give you resource
+#      metrics for exactly one of your three nodes and nothing for the
+#      other two, which defeats the entire point of "resource usage across
+#      the cluster." They also publish their ports in `mode: host` rather
+#      than the default routing-mesh mode -- see the long comment on
+#      cadvisor below for why, and the required prometheus.yml change this
+#      implies.
+#
+#   3. depends_on is deliberately NOT used anywhere in this file, including
+#      for the newly-added services. `docker stack deploy` does not support
+#      depends_on conditions (service_healthy / service_completed_successfully)
+#      at all -- that's a docker-compose-CLI-only feature -- and Swarm mode
+#      has no native concept of startup ordering between services. This
+#      matches the original file's own behavior (it already had zero
+#      depends_on blocks); robustness instead comes entirely from each
+#      service's own retry logic (kafka-init's and connect-init's polling
+#      loops, Kafka client libraries' own reconnect behavior, etc.).
+# =============================================================================
+
 networks:
   fraud_network:
     driver: overlay
@@ -7,11 +47,52 @@ networks:
     driver_opts:
       com.docker.network.driver.mtu: "1200"
 
+# =============================================================================
+# Swarm configs -- replaces every bind-mounted config file from the
+# single-host docker-compose.yml. `file:` sources are read from disk at
+# `docker stack deploy` time and distributed to whichever node(s) actually
+# need them; unlike a bind mount, this works regardless of node placement.
+# =============================================================================
+configs:
+  debezium_connector_config:
+    file: ../debezium-postgres-connector.json
+  prometheus_config:
+    file: ./prometheus.yml
+  grafana_datasource_config:
+    file: ../grafana/provisioning/datasources/ds-prometheus.yml
+  grafana_dashboard_provider_config:
+    file: ../grafana/provisioning/dashboards/dashboards.yml
+  grafana_dashboard_cluster_resources:
+    file: ../grafana/dashboards/cluster-resource-usage.json
+  grafana_dashboard_fraud_redundancy:
+    file: ../grafana/dashboards/fraud-engine-redundancy.json
+
+# =============================================================================
+# Swarm secrets -- postgres credentials only, in this pass. Created OUT OF
+# BAND before `docker stack deploy` runs, e.g.:
+#   printf 'SecureBankPassword2026!' | docker secret create postgres_password -
+# `external: true` means this file only REFERENCES the secret by name; it
+# never contains the credential itself, unlike every other password in this
+# file (KNOWN FOLLOW-UP, not fixed in this pass -- see the changelog at the
+# bottom: api's DATABASE_URL, DEMO_ADMIN_KEY, and the OpenSearch/Grafana
+# admin/admin credentials are all still plaintext environment variables
+# here, exactly as they were in the single-host file. Doing the same fix
+# for api's DATABASE_URL specifically requires either assembling the
+# connection string from a secret-mounted file inside a small entrypoint
+# wrapper, or code changes to api's own database.py to accept the pieces
+# separately -- neither of which has been verified against the live api
+# image in this pass, so it's flagged here rather than silently claimed
+# as done.
+# =============================================================================
+secrets:
+  postgres_password:
+    external: true
+
 services:
   # =========================================================================
   # NODE 1: k3s-master (100.68.40.33)
   # =========================================================================
-  
+
   postgres:
     image: banking-postgres:latest
     entrypoint:
@@ -27,7 +108,14 @@ services:
     environment:
       POSTGRES_DB: banking_db
       POSTGRES_USER: postgres_admin
-      POSTGRES_PASSWORD: SecureBankPassword2026!
+      # Password now comes from the Swarm secret below via
+      # POSTGRES_PASSWORD_FILE -- postgres-init.sh has been updated to
+      # check for this first, matching the official Postgres image's own
+      # convention, and only fall back to POSTGRES_PASSWORD (unset here)
+      # if no _FILE variant is present.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
     ports:
       - "5432:5432"
     volumes:
@@ -45,9 +133,13 @@ services:
   api:
     image: banking-api:latest
     environment:
+      # KNOWN FOLLOW-UP (see secrets: block above): this still embeds the
+      # password in plaintext. Not fixed in this pass.
       DATABASE_URL: postgresql://postgres_admin:SecureBankPassword2026!@postgres:5432/banking_db
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      ENABLE_DEMO_RESET: "true"
+      DEMO_ADMIN_KEY: secret-demo-key-99
     ports:
       - "8000:8000"
     networks:
@@ -95,6 +187,48 @@ services:
       restart_policy:
         condition: on-failure
 
+  # =========================================================================
+  # ADDED -- was entirely missing from this file. Without it, the Debezium
+  # connector is never actually registered against kafka-connect's REST API,
+  # meaning CDC silently never starts even though kafka-connect itself is
+  # "running". Uses the Swarm config above instead of the single-host
+  # version's bind mount, for the reason explained at the top of this file.
+  # =========================================================================
+  connect-init:
+    image: curlimages/curl:latest
+    networks:
+      - fraud_network
+    configs:
+      - source: debezium_connector_config
+        target: /tmp/debezium-postgres-connector.json
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo 'Waiting for Kafka Connect availability...'
+        until curl -fs http://kafka-connect:8083/connectors >/dev/null 2>&1; do
+          sleep 5
+        done
+
+        echo 'Registering Debezium connector if missing...'
+        if curl -s -o /dev/null -w '%{http_code}' http://kafka-connect:8083/connectors/banking-cdc-connector | grep -q '^200$$'; then
+          echo 'Connector already registered.'
+          exit 0
+        fi
+
+        curl -s -X POST \
+          -H 'Content-Type: application/json' \
+          --data @/tmp/debezium-postgres-connector.json \
+          http://kafka-connect:8083/connectors
+
+        echo 'Connector registration complete.'
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-master
+      restart_policy:
+        condition: none
+
   kafka-init:
     image: confluentinc/cp-kafka:7.4.0
     networks:
@@ -134,7 +268,7 @@ services:
   # =========================================================================
   # NODE 2: k3s-worker-2 (100.120.104.76)
   # =========================================================================
-  
+
   kafka:
     image: confluentinc/cp-kafka:7.4.0
     environment:
@@ -182,9 +316,33 @@ services:
         condition: on-failure
 
   # =========================================================================
+  # ADDED -- was entirely missing. Mirrors the single-host file's
+  # kafka-exporter service exactly; no Swarm-specific changes needed here,
+  # it's a pure metrics endpoint with no bind mounts or per-node concerns.
+  # =========================================================================
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    command:
+      - '--kafka.server=kafka:9092'
+    ports:
+      - "9308:9308"
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-2
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 128M
+      restart_policy:
+        condition: on-failure
+
+  # =========================================================================
   # NODE 3: k3s-worker-3 (100.109.78.25)
   # =========================================================================
-  
+
   opensearch:
     image: opensearchproject/opensearch:2.11.0
     environment:
@@ -223,13 +381,46 @@ services:
       restart_policy:
         condition: on-failure
 
+  # =========================================================================
+  # ADDED -- was entirely missing. Without this, CDC events and telemetry
+  # keep flowing through Kafka correctly, but nothing ever lands in
+  # OpenSearch for threat-hunting -- the "alerts"/"login_events"/etc.
+  # indices would just stay permanently empty on a Swarm deployment.
+  # =========================================================================
+  opensearch-sink:
+    image: banking-opensearch-sink:latest
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      OPENSEARCH_HOST: opensearch
+      OPENSEARCH_PORT: "9200"
+      OPENSEARCH_USER: admin
+      OPENSEARCH_PASSWORD: admin
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-3
+      restart_policy:
+        condition: on-failure
+
   flink-jobmanager:
     image: flink:1.18-scala_2.12
     ports:
       - "8082:8081"
+      - "9249:9249"
     command: jobmanager
     environment:
       JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+      # ADDED -- the single-host version sets these directly via
+      # FLINK_PROPERTIES for the Prometheus reporter; ported here the same
+      # way rather than dropped, since without it flink-jobmanager exposes
+      # no :9249 metrics for Prometheus to scrape at all.
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
     networks:
       - fraud_network
     deploy:
@@ -244,6 +435,11 @@ services:
     command: taskmanager
     environment:
       JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
     networks:
       - fraud_network
     deploy:
@@ -258,6 +454,14 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       FLINK_RISK_GROUP_ID: fraud-engine-v2
+      KAFKA_FRAUD_ALERT_TOPIC: fraud_alerts_v2
+      KAFKA_CRITICAL_ALERT_TOPIC: critical_alerts_v2
+      FLINK_JOBMANAGER_HOST: flink-jobmanager
+      FLINK_JOBMANAGER_PORT: "8081"
+      OPENSEARCH_HOST: opensearch
+      OPENSEARCH_PORT: "9200"
+      OPENSEARCH_USER: admin
+      OPENSEARCH_PASSWORD: admin
     networks:
       - fraud_network
     deploy:
@@ -267,7 +471,233 @@ services:
       restart_policy:
         condition: on-failure
 
+  # =========================================================================
+  # ADDED -- the whole point of this update. Active-active secondary risk
+  # engine, same as fraud-engine-secondary in the single-host file. Placed
+  # on k3s-worker-3 alongside the other scoring/analytics workloads.
+  # =========================================================================
+  fraud-engine-secondary:
+    image: banking-fraud-engine-secondary:latest
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      SECONDARY_ENGINE_GROUP_ID: fraud-engine-secondary-v1
+      SECONDARY_ENGINE_METRICS_PORT: "9500"
+      SECONDARY_FRAUD_TOPIC: fraud_alerts
+      SECONDARY_CRITICAL_TOPIC: critical_alerts
+      API_REQUEST_SCHEMA_PATH: /app/config/schemas/api_request.avsc
+    ports:
+      - "9500:9500"
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-3
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 384M
+      restart_policy:
+        condition: on-failure
+
+  # =========================================================================
+  # ADDED -- redundancy/liveness watchdog for the two engines above.
+  # =========================================================================
+  fraud-engine-watchdog:
+    image: banking-fraud-engine-watchdog:latest
+    environment:
+      FLINK_JOBMANAGER_URL: http://flink-jobmanager:8081
+      SECONDARY_ENGINE_METRICS_URL: http://fraud-engine-secondary:9500/metrics
+      WATCHDOG_METRICS_PORT: "9600"
+      WATCHDOG_INTERVAL_SEC: "15"
+    ports:
+      # Host port 9601 here too, same reason as the single-host file: 9600
+      # is already OpenSearch's own performance-analyzer port, and both
+      # services can land on overlapping ports via the routing mesh.
+      - "9601:9600"
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-worker-3
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 64M
+      restart_policy:
+        condition: on-failure
+
+  # =========================================================================
+  # ADDED -- was entirely missing. Configs replace the single-host
+  # bind mounts, per the note at the top of this file.
+  # =========================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    configs:
+      - source: prometheus_config
+        target: /etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=2d'
+      - '--storage.tsdb.retention.size=2GB'
+    ports:
+      - "9090:9090"
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-master
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    configs:
+      - source: grafana_datasource_config
+        target: /etc/grafana/provisioning/datasources/ds-prometheus.yml
+      - source: grafana_dashboard_provider_config
+        target: /etc/grafana/provisioning/dashboards/dashboards.yml
+      - source: grafana_dashboard_cluster_resources
+        target: /var/lib/grafana/dashboards/cluster-resource-usage.json
+      - source: grafana_dashboard_fraud_redundancy
+        target: /var/lib/grafana/dashboards/fraud-engine-redundancy.json
+    ports:
+      - "3000:3000"
+    networks:
+      - fraud_network
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == k3s-master
+      resources:
+        limits:
+          cpus: '0.20'
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+
+  # =========================================================================
+  # ADDED -- deploy.mode: global, NOT pinned to one node. See the long
+  # comment at the top of this file for why. `mode: host` on the port
+  # publishing is the other Swarm-specific correction: it binds directly to
+  # each node's own host port instead of going through Swarm's routing
+  # mesh. This matters here specifically because the routing mesh would
+  # otherwise load-balance any request to "cadvisor:8085" across all three
+  # nodes' cadvisor tasks round-robin -- which is exactly wrong for a
+  # per-node metrics scrape, where Prometheus needs to reach EACH node's
+  # cadvisor individually, not a random one of the three.
+  #
+  # CONSEQUENCE FOR prometheus.yml: static_configs targeting a single
+  # "cadvisor:8080" hostname (as the single-host prometheus.yml does) will
+  # NOT correctly scrape all three nodes under this pattern. It needs to
+  # target each node's real host IP directly instead:
+  #   - job_name: 'cadvisor'
+  #     static_configs:
+  #       - targets: ['100.68.40.33:8085', '100.120.104.76:8085', '100.109.78.25:8085']
+  #   - job_name: 'node-exporter'
+  #     static_configs:
+  #       - targets: ['100.68.40.33:9100', '100.120.104.76:9100', '100.109.78.25:9100']
+  # A more production-grade approach would use Prometheus's docker_sd_configs
+  # for dynamic Swarm task discovery instead of hardcoded IPs, but given
+  # this file already hardcodes all three node identities and IPs
+  # throughout (see KAFKA_ADVERTISED_LISTENERS above, and the node
+  # placement constraints everywhere), static IP targets are consistent
+  # with the rest of this file's existing style rather than a bigger
+  # architectural jump.
+  # =========================================================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks:
+      - fraud_network
+    ports:
+      - target: 8080
+        published: 8085
+        mode: host
+    deploy:
+      mode: global
+      resources:
+        limits:
+          cpus: '0.20'
+          memory: 200M
+      restart_policy:
+        condition: on-failure
+    # Same note as the single-host file: /dev/kmsg + privileged are omitted;
+    # add them for full OOM-event coverage on a confirmed-Linux node.
+
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - fraud_network
+    ports:
+      - target: 9100
+        published: 9100
+        mode: host
+    deploy:
+      mode: global
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 128M
+      restart_policy:
+        condition: on-failure
+
 volumes:
   pgdata:
   kafkadata_kraft:
   osdata:
+
+# =============================================================================
+# CHANGELOG vs. the previous version of this file
+# =============================================================================
+# ADDED (were entirely missing):
+#   connect-init, kafka-exporter, opensearch-sink, fraud-engine-secondary,
+#   fraud-engine-watchdog, prometheus, grafana, cadvisor, node-exporter
+#
+# RENAMED for consistency with docker-compose.yml / the handbook:
+#   (none -- kept this file's existing "kafka-connect" / "flink-risk-engine"
+#   naming rather than renaming to "connect" / "fraud-engine", since
+#   external tooling or scripts may already reference these Swarm service
+#   names specifically. Worth a deliberate decision later, not silently
+#   changed here.)
+#
+# SWARM-SPECIFIC CORRECTIONS (not mechanical ports):
+#   - All bind-mounted configs converted to Swarm `configs:` objects
+#   - cadvisor/node-exporter use `deploy.mode: global` + `mode: host` ports
+#   - postgres password now sourced from a Swarm secret (POSTGRES_PASSWORD_FILE)
+#
+# STILL PLAINTEXT (known follow-up, not fixed in this pass):
+#   - api's DATABASE_URL, DEMO_ADMIN_KEY
+#   - OpenSearch admin/admin, Grafana admin/admin
+#
+# REQUIRED COMPANION FILE, INCLUDED:
+#   - infra/prometheus.yml is a NEW, separate file from prometheus/prometheus.yml
+#     (the single-host version) -- it lists all three node IPs directly for
+#     the cadvisor/node-exporter jobs (see the cadvisor comment above for
+#     why the single-host file's container-name-based targets wouldn't work
+#     here). Every other job in it is identical in substance, just
+#     addressed by Swarm service name instead of container_name.
+# =============================================================================
