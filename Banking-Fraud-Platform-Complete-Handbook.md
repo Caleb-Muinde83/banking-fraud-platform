@@ -192,141 +192,313 @@ What a production deployment of *this specific repository* would still need befo
 
 **Repository fact.** The following diagram is derived directly from `docker-compose.yml` — every box is a real container, every arrow is a real network dependency (`depends_on`) or data relationship visible in the code.
 
-```text
-                         ┌───────────────────────────┐
-                         │   Simulator (Python)      │
-                         │  customer/employee actors  │
-                         │  + attack scenario engine  │
-                         └─────────────┬──────────────┘
-                                       │ HTTP (httpx)
-                                       ▼
-   ┌───────────────────────────────────────────────────────────────────┐
-   │                    FastAPI Core Banking API (bank_api)             │
-   │  /api/login  /api/transfers  /api/beneficiaries  /api/employee/*   │
-   │  /incidents  /analytics/metrics  /api/graph/*  /api/demo/*         │
-   │                                                                     │
-   │  KafkaRequestLoggerMiddleware ──────► api_requests topic (Avro)    │
-   │  Prometheus metrics middleware ─────► /metrics endpoint             │
-   └───────────┬───────────────────────────────────────────┬───────────┘
-               │ SQL (SQLAlchemy, async + sync)              │
-               ▼                                             │
-   ┌────────────────────────┐                                │
-   │  PostgreSQL 15          │                                │
-   │  wal_level=logical       │                                │
-   │  (bank_postgres)          │                                │
-   └───────────┬──────────────┘                                │
-               │ logical replication (WAL)                     │
-               ▼                                               │
-   ┌────────────────────────────┐                              │
-   │  Kafka Connect + Debezium   │                              │
-   │  (bank_connect)               │                              │
-   │  banking-cdc-connector          │                              │
-   └───────────┬────────────────────┘                              │
-               │ CDC events: banking.accounts, banking.transactions,│
-               │ banking.login_events, banking.sessions,             │
-               │ banking.beneficiaries, banking.employee_actions      │
-               ▼                                                     ▼
-   ┌───────────────────────────────────────────────────────────────────┐
-   │                     Apache Kafka (KRaft mode, bank_kafka)           │
-   │   Topics: api_requests · dead_letter_queue · fraud_alerts_v2 ·      │
-   │   critical_alerts_v2 · banking.* CDC topics · (legacy topics)       │
-   └───────┬───────────────────────────────────┬─────────────────┬─────┘
-           │                                   │                  │
-           │ consumes                          │ consumes         │ consumes
-           ▼                                   ▼                  ▼
-┌────────────────────────┐   ┌───────────────────────────┐  ┌─────────────────────┐
-│ Apache Flink Cluster    │   │ Python Stream Scripts       │  │ OpenSearch Sink        │
-│ (JobManager+TaskManager)  │   │ (rules_engine.py,             │  │ (bank_opensearch_sink)  │
-│ RiskScoringJob.java        │   │  risk_scoring_engine.py)       │  │ one thread per topic      │
-│ → fraud_alerts_v2            │   │ → fraud_alerts / high_risk_alerts│  │ → OpenSearch indices       │
-│ → critical_alerts_v2           │   └───────────────────────────┘  └──────────┬────────────┘
-└───────────┬─────────────────┘                                                 │
-            │ Avro (Schema Registry)                                              ▼
-            ▼                                                          ┌────────────────────┐
-┌───────────────────────────┐                                          │ OpenSearch (bank_opensearch) │
-│ alert_aggregator.py worker  │◄─────────────── consumes fraud_alerts_v2 │ indices: api_requests,        │
-│ (dedupe alerts → Incidents)  │                                          │ login_events, employee_actions, │
-└───────────┬─────────────────┘                                          │ alerts                          │
-            │ writes                                                     └───────────┬────────────────────┘
-            ▼                                                                        │
-┌────────────────────────────┐                                            ┌──────────▼─────────────┐
-│ PostgreSQL: incidents,        │                                            │ OpenSearch Dashboards     │
-│ incident_alerts,                │                                            │ (bank_opensearch_dashboards)│
-│ incident_audit_logs table         │                                            └─────────────────────────┘
-└────────────────────────────┘
+The Component Diagram
+======================
+Repository fact. Every box below is a real container in docker-compose.yml;
+every arrow is a real network dependency or data relationship visible in the
+code. (v2 — corrected for the active-active secondary engine, watchdog, graph
+analytics, and observability additions. One known gap flagged inline: ⚠️)
 
-        ┌──────────────────────────────────────────────────────────┐
-        │                  Observability Plane                       │
-        │  Prometheus (scrapes bank_api, Flink JM, Kafka Exporter)    │
-        │  ─► Grafana dashboards                                        │
-        │  Kafka Exporter (bank_kafka_exporter) ─► Kafka broker metrics  │
-        └──────────────────────────────────────────────────────────┘
-```
-
-A few things in this diagram are worth calling attention to explicitly because they are easy to miss on a first read:
-
-**Architectural inference.** The Python stream scripts (`rules_engine.py`, `risk_scoring_engine.py`) and the Java Flink engine both consume from Kafka and both compute fraud risk, but they are not wired together in `docker-compose.yml` at all — neither script has a container definition. They exist in the repository as earlier iterations of the same idea (Chapter 7 covers this in detail), and the Java Flink engine (`fraud-engine` service) is the one actually deployed and running. This is a common and healthy pattern in a project's history — build a lightweight prototype first, validate the idea works, then rebuild it properly — but it means a reader exploring the `analytics/` directory needs to know which code is live and which is historical, which this handbook makes explicit throughout.
-
-## 2.2 The request lifecycle (a single API call, traced end to end)
+# The Request Lifecycle (a single API call, traced end to end)
 
 This section traces one HTTP request — `POST /api/transfers` — through every system it touches, in the order things actually happen.
 
+**Correction from the previous version:** Step 3 named the wrong handler. `POST /api/transfers` is registered **twice** — once inline in `main.py` (`async def execute_transfer`, line 330, using `AsyncSession`), and once via `app.include_router(transfers.router)` (`api/app/api/transfers.py`, a synchronous handler with `_ensure_account_exists()`). Confirmed directly against `main.py`: the inline route is registered at line 330, and `app.include_router(transfers.router)` doesn't run until line 438 — over a hundred lines later. FastAPI matches the **first** registration for a given path+method, so the inline `main.py` handler is the one every real request actually hits; the router's version in `transfers.py` is unreachable dead code. The trace below now follows the handler that's actually live.
+
 ```text
- 1. Simulator (or a real client) sends:
+1. Simulator (or a real client) sends:
+
     POST /api/transfers  { from_account, to_account, amount, currency }
+
                     │
+
                     ▼
+
  2. FastAPI receives the request.
+
     KafkaRequestLoggerMiddleware.dispatch() runs FIRST (it wraps call_next).
+
                     │
+
                     ▼
+
  3. call_next(request) invokes the route handler:
-    execute_transfer() in app/api/transfers.py
-      - _ensure_account_exists() JIT-creates missing Customer/Account rows
-        if the simulator references accounts that don't exist yet
-      - debits source_acc.balance, credits target_acc.balance
+
+    execute_transfer() — the INLINE handler in app/main.py (line 330),
+
+    NOT app/api/transfers.py's version, which is registered later via
+
+    app.include_router() and is unreachable for this exact reason.
+
+      - for each of from_account/to_account: if the Account row doesn't
+
+        exist, fail-open provisioning kicks in inline (no separately named
+
+        helper here, unlike the shadowed transfers.py version) — creates a
+
+        provisional Customer if needed via build_provisional_customer(
+
+        customer_id, country="UNKNOWN", risk_level="HIGH"). This runs
+
+        uniformly for WHICHEVER of the two accounts is missing (not
+
+        "the destination" specifically — it's the same logic applied per
+
+        missing account in the loop; it just tends to be the destination
+
+        in the common mule-account scenario), using x_user_id as the
+
+        customer_id for a missing from_account or a hardcoded
+
+        "cust_external_mule" for a missing to_account — then a new
+
+        Account with a starting balance of $15,000.00
+
+      - debits acc_from.balance, credits acc_to.balance (plain float
+
+        arithmetic, no decimal/fixed-point handling)
+
       - INSERTs a new row into the `transactions` table
+
       - db.commit()
+
+      - returns {"status": "PROCESSED", "transaction_id": tx_id} — NOT a
+
+        TransactionResponse model; this route has no declared response_model
+
+        at all, so FastAPI serializes this raw dict as-is
+
                     │
+
                     ▼
+
  4. PostgreSQL's Write-Ahead Log (WAL) records the INSERT.
+
     (This step happens independently of steps 5-6 below — Postgres doesn't
+
     know or care that Debezium exists; it just writes its WAL as always.)
+
                     │
+
                     ▼
- 5. Route handler returns a TransactionResponse. FastAPI serializes it to JSON.
+
+ 5. Route handler returns. FastAPI serializes the dict to JSON.
+
                     │
+
                     ▼
+
  6. Control returns to KafkaRequestLoggerMiddleware's `finally` block.
+
     A background asyncio task is scheduled (NOT awaited) to call
+
     send_telemetry_event() with {request_id, ip_address, endpoint, method,
+
     status_code, timestamp}. The HTTP response is sent to the client
+
     immediately — the client never waits for step 7.
+
                     │
+
                     ▼
+
  7. (Background, off the request path) send_telemetry_event() Avro-encodes
+
     the payload against the api_request.avsc schema and produces it to the
+
     `api_requests` Kafka topic. On any serialization failure, it produces a
+
     JSON fallback to `dead_letter_queue` instead of dropping the event.
+
+
 
  --- MEANWHILE, ASYNCHRONOUSLY, ON A COMPLETELY SEPARATE PATH ---
 
+
+
  8. Debezium's PostgreSQL connector, which is continuously tailing the WAL
+
     via a logical replication slot, picks up the INSERT from step 4 within
+
     milliseconds of it being committed (not tied to the HTTP request at all).
+
                     │
+
                     ▼
+
  9. Debezium emits a CDC envelope { before: null, after: {...row...},
+
     source: {table: "transactions", ...}, op: "c", ts_ms: ... } to the
+
     `banking.transactions` Kafka topic.
+
                     │
+
                     ▼
+
 10. Both the api_requests event (step 7) and the banking.transactions CDC
-    event (step 9) are now sitting in Kafka, available to any consumer:
-    the Flink risk engine, the Python stream scripts, and the OpenSearch
-    sink all pick them up independently, on their own schedules.
+
+    event (step 9) are now sitting in Kafka, available to any consumer.
+
+    THREE consumers pick these up independently, on their own schedules,
+
+    all active-active — not "Flink + generic Python scripts":
+
+      - Apache Flink (RiskScoringJob.java) — PRIMARY scoring engine
+
+      - Secondary Risk Engine (secondary_risk_engine.py) — ACTIVE-ACTIVE
+
+        with Flink, consuming the same raw topics independently, not a
+
+        downstream consumer of Flink's own output
+
+      - OpenSearch Sink (opensearch_sink.py) — indexes both events for
+
+        threat-hunting, one dedicated consumer thread per topic
+
+    (The old, never-wired-in rules_engine.py/risk_scoring_engine.py pair
+
+    are NOT part of this list — they were superseded by the secondary
+
+    engine above and aren't built or started by docker-compose.yml.)
 ```
 
+## What else is worth double-checking if this diagram gets reused
+
+- **The $15,000 starting balance and the plain-float arithmetic** on step 3 are both real, both worth keeping visible rather than smoothing over — they're exactly the kind of detail Chapter 3's "Production Perspective" section flags (fail-open provisioning is a demo-appropriate choice, not a production one; float arithmetic on currency is a known source of reconciliation drift at scale).
+- **No `response_model`** on this route means FastAPI won't validate or filter the response shape — if `execute_transfer`'s return dict ever drifted from what a client expects, nothing would catch it at the API layer. Worth knowing if this diagram is being used to reason about API contracts, not just data flow.
+
+# 2. FastAPI receives the request.
+
+`KafkaRequestLoggerMiddleware.dispatch()` runs **FIRST** (it wraps `call_next`).
+
+```
+                │
+                ▼
+```
+
+# 3. `call_next(request)` invokes the route handler:
+
+`execute_transfer()` — the INLINE handler in `app/main.py` (line 330),
+
+NOT `app/api/transfers.py`'s version, which is registered later via
+
+`app.include_router()` and is unreachable for this exact reason.
+
+- for each of `from_account` / `to_account`: if the `Account` row doesn't exist, fail-open provisioning kicks in inline (no separately named helper here, unlike the shadowed `transfers.py` version) — creates a provisional `Customer` if needed (`build_provisional_customer`, risk tier `"HIGH"` for the destination, using `x_user_id` or a hardcoded `"cust_external_mule"` fallback identity), then a new `Account` with a starting balance of **$15,000.00**
+- debits `acc_from.balance`, credits `acc_to.balance` (plain float arithmetic, no decimal/fixed-point handling)
+- `INSERT`s a new row into the `transactions` table
+- `db.commit()`
+- returns:
+
+```json
+{
+  "status": "PROCESSED",
+  "transaction_id": tx_id
+}
+```
+
+NOT a `TransactionResponse` model; this route has no declared `response_model` at all, so FastAPI serializes this raw dict as-is.
+
+```
+                │
+                ▼
+```
+
+# 4. PostgreSQL's Write-Ahead Log (WAL) records the INSERT.
+
+(This step happens independently of steps 5–6 below — Postgres doesn't know or care that Debezium exists; it just writes its WAL as always.)
+
+```
+                │
+                ▼
+```
+
+# 5. Route handler returns.
+
+FastAPI serializes the dict to JSON.
+
+```
+                │
+                ▼
+```
+
+# 6. Control returns to `KafkaRequestLoggerMiddleware`'s `finally` block.
+
+A background `asyncio` task is scheduled (**NOT awaited**) to call `send_telemetry_event()` with:
+
+```text
+{
+  request_id,
+  ip_address,
+  endpoint,
+  method,
+  status_code,
+  timestamp
+}
+```
+
+The HTTP response is sent to the client immediately — the client never waits for step 7.
+
+```
+                │
+                ▼
+```
+
+# 7. (Background, off the request path)
+
+`send_telemetry_event()` Avro-encodes the payload against the `api_request.avsc` schema and produces it to the `api_requests` Kafka topic.
+
+On any serialization failure, it produces a JSON fallback to `dead_letter_queue` instead of dropping the event.
+
+---
+
+# MEANWHILE, ASYNCHRONOUSLY, ON A COMPLETELY SEPARATE PATH
+
+# 8. Debezium's PostgreSQL connector,
+
+which is continuously tailing the WAL via a logical replication slot, picks up the INSERT from step 4 within milliseconds of it being committed (not tied to the HTTP request at all).
+
+```
+                │
+                ▼
+```
+
+# 9. Debezium emits a CDC envelope
+
+```text
+{
+  before: null,
+  after: {...row...},
+  source: {
+    table: "transactions",
+    ...
+  },
+  op: "c",
+  ts_ms: ...
+}
+```
+
+to the `banking.transactions` Kafka topic.
+
+```
+                │
+                ▼
+```
+
+# 10. Both the `api_requests` event (step 7) and the `banking.transactions` CDC event (step 9) are now sitting in Kafka,
+
+available to any consumer.
+
+THREE consumers pick these up independently, on their own schedules, all active-active — not "Flink + generic Python scripts":
+
+- Apache Flink (`RiskScoringJob.java`) — PRIMARY scoring engine
+- Secondary Risk Engine (`secondary_risk_engine.py`) — ACTIVE-ACTIVE with Flink, consuming the same raw topics independently, not a downstream consumer of Flink's own output
+- OpenSearch Sink (`opensearch_sink.py`) — indexes both events for threat-hunting, one dedicated consumer thread per topic
+
+(The old, never-wired-in `rules_engine.py` / `risk_scoring_engine.py` pair are **NOT** part of this list — they were superseded by the secondary engine above and aren't built or started by `docker-compose.yml`.)
+```
+```
 The single most important thing to notice in this trace is that **steps 6-7 (telemetry) and steps 8-9 (CDC) are on two entirely different clocks**, and neither blocks the HTTP response the client sees in step 5. The client gets their transfer confirmation as fast as PostgreSQL can commit a row; the fraud-detection machinery downstream operates on a separate, asynchronous timeline, typically resolving to an alert within seconds — but critically, *after* the money has already moved. This is a direct, concrete illustration of the latency/correctness tradeoff discussed in Chapter 1: catching this specific fraud pattern in-line, before the transfer completed, is architecturally possible (Flink could theoretically score it before the API responds) but this codebase does not do that — it optimizes for API responsiveness and detects fraud as a fast-follow reaction instead. Chapter 8 discusses this choice, and what would need to change to move it in-line, in the Production Perspective section.
 
 ## 2.3 The event lifecycle: from raw bytes to a fraud alert
@@ -341,8 +513,8 @@ banking.login_events topic
         │   "source":{"table":"login_events",...},"op":"c","ts_ms":1783395584407}
         ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  RiskEventNormalizer.normalize()  (Flink, Java)                     │
-│  - unwraps the CDC envelope, reads the "after" block                  │
+│  RiskEventNormalizer.normalize()  (Flink, Java)                 │
+│  - unwraps the CDC envelope, reads the "after" block            │
 │  - extracts customer_id → identityKey = "cust_gen_4"                   │
 │  - extracts country, device_id, login success flag                       │
 │  → RiskEvent object                                                        │
@@ -676,15 +848,15 @@ The following table consolidates what `domain.py`, the Alembic migration, and `s
 | Table | Key columns | Purpose | CDC-captured? |
 |---|---|---|---|
 | `customers` | `customer_id` (PK), `first_name`, `last_name`, `email`, `country`, `risk_level` | Identity record for every account holder, including system fallback identities | No |
-| `accounts` | `account_id` (PK), `customer_id` (FK), `balance`, `currency`, `status` | The ledger — balances live here | **Yes** |
-| `transactions` | `transaction_id` (PK), `from_account`, `to_account`, `amount`, `currency`, `transaction_type` | Money movement between accounts. No `customer_id` column at all — a fact that drives real design decisions in Chapter 8 | **Yes** |
+| `accounts` | `account_id` (PK), `customer_id` (FK), `balance`, `currency`, `status` | The ledger balances live here | **Yes** |
+| `transactions` | `transaction_id` (PK), `from_account`, `to_account`, `amount`, `currency`, `transaction_type` | Money movement between accounts. No `customer_id` column at all  a fact that drives real design decisions in Chapter 8 | **Yes** |
 | `login_events` | `event_id` (PK), `customer_id` (FK), `device_id`, `country`, `ip_address`, `success`, `latitude`, `longitude` | Authentication attempts, success or failure | **Yes** |
-| `sessions` | `session_id` (PK), `customer_id` (FK), `device_id`, `ip_address`, `expires_at` | Active login sessions. No country/geo column — also drives a Flink design decision in Chapter 8 | **Yes** |
+| `sessions` | `session_id` (PK), `customer_id` (FK), `device_id`, `ip_address`, `expires_at` | Active login sessions. No country/geo column also drives a Flink design decision in Chapter 8 | **Yes** |
 | `devices` | `device_id` (PK), `customer_id` (FK), `device_type`, `first_seen`, `risk_score` | Known device fingerprints per customer | No |
 | `beneficiaries` | `beneficiary_id` (PK), `customer_id` (FK), `account_number`, `bank_name` | Saved transfer recipients | **Yes** |
 | `employees` | `employee_id` (PK), `department`, `role` | Internal bank staff | No |
-| `employee_actions` | `action_id` (PK), `employee_id` (FK), `customer_id` (FK, nullable), `action_type` | Staff audit trail — insider-threat detection surface | **Yes** |
-| `alerts`, `cases`, `audit_events` | — | Legacy/simple alerting tables predating the `incidents` model | No |
+| `employee_actions` | `action_id` (PK), `employee_id` (FK), `customer_id` (FK, nullable), `action_type` | Staff audit trail insider-threat detection surface | **Yes** |
+| `alerts`, `cases`, `audit_events` | _______________ | Legacy/simple alerting tables predating the `incidents` model | No |
 | `cards` | `card_id` (PK), `customer_id` (FK), `account_id` (FK), `card_number`, `status` | Debit/credit card records | No |
 | `incidents` | `id` (UUID PK), `identity_key`, `status`, `severity`, `alert_count`, `max_risk_score` | Deduplicated fraud cases (Chapter 2, §2.5) | No |
 | `incident_alerts` | `id` (UUID PK), `incident_id` (FK), `alert_id`, `indicator`, `risk_score`, `raw_payload` (JSONB) | Individual alerts folded into an incident | No |
@@ -871,16 +1043,16 @@ Reading this configuration field by field is the fastest way to actually underst
 |---|---|
 | `before` | The row's prior state. `null` for inserts and for the initial snapshot. Populated for updates and deletes. |
 | `after` | The row's new state. `null` for deletes (the row no longer exists). |
-| `source` | Metadata about *where this event came from* — which table, which connector, the source database's own timestamp (`ts_ms` here is inside `source`, distinct from the envelope's top-level `ts_ms`). |
-| `op` | The single-character operation code — see the table below. |
+| `source` | Metadata about *where this event came from*? Which table, which connector, the source database's own timestamp (`ts_ms` here is inside `source`, distinct from the envelope's top level `ts_ms`). |
+| `op` | The single character operation code. See the table below. |
 | `ts_ms` | The envelope-level timestamp, in true milliseconds, regardless of the source column's own precision. |
 
 | `op` value | Meaning |
 |---|---|
-| `r` | Initial snapshot read — when a connector first starts, Debezium takes a consistent snapshot of every row already in an included table, and emits each one with `op: "r"` before switching over to live WAL streaming. |
+| `r` | Initial snapshot read when a connector first starts, Debezium takes a consistent snapshot of every row already in an included table, and emits each one with `op: "r"` before switching over to live WAL streaming. |
 | `c` | Create (`INSERT`) |
 | `u` | Update (`UPDATE`) |
-| `d` | Delete (`DELETE`) — note `after` is `null` here; the deleted row's last known state is in `before` instead. |
+| `d` | Delete (`DELETE`) : note `after` is `null` here; the deleted row's last known state is in `before` instead. |
 
 **Architectural inference.** Notice the `ts_ms` distinction called out in the table above: the envelope's top-level `ts_ms` (in this example, `1781920055239`, thirteen digits — genuine Unix epoch milliseconds) is different from `after.created_at` (`1781913231931852`, sixteen digits). This is not a formatting inconsistency to be fixed — it's PostgreSQL's own column value, at whatever time precision that column happens to store (`time.precision.mode` defaults to "adaptive," meaning a plain `TIMESTAMP` column round-trips as microseconds, not milliseconds), passed through completely unmodified inside `after`, versus Debezium's own envelope-level `ts_ms`, which is *documented* by Debezium to always be real milliseconds regardless of the source column's precision. Two independent parts of this codebase — `RiskEventNormalizer.java` in the Flink engine (Chapter 8) and `unwrap_cdc_envelope()` in the OpenSearch sink (Chapter 9) — both explicitly rely on the envelope's `ts_ms` rather than any row-level timestamp column for exactly this reason, and both carry code comments documenting having discovered and corrected this the hard way. This is a genuinely instructive real-world lesson: a schema that looks self-evidently "just a timestamp" can carry a subtle precision trap that only becomes visible once two independent consumers of the same data disagree about what a raw value means.
 
@@ -1496,7 +1668,7 @@ This function computes an alert ID from *only* the identity, severity, and which
 | `transactions` | `VELOCITY_VIOLATION` | 4 or more transactions within a 5-minute rolling window |
 | `transactions` | `HIGH_RISK_RECIPIENT` | `to_account` appears in a configured allowlist (`HIGH_RISK_RECIPIENTS`, empty by default) |
 | `api_requests` | `SUSPICIOUS_API_PATTERN` | 50 or more requests within a 60-second rolling window |
-| `sessions` | *(none)* | Explicitly a no-op — see below |
+| `sessions` | *(none)* | Explicitly a no-op. See below |
 
 The `sessions` case is worth quoting directly, because it's another instance of the same honest, schema-driven reasoning already seen in §8.3:
 
@@ -1965,49 +2137,136 @@ A distributed system with sixteen interdependent containers has a problem that a
 - **`condition: service_started`** — wait only until the target's container process has started, with no readiness guarantee at all. Used where a genuine health check either isn't warranted or isn't practical — for instance, a dependency on `kafka-init` (a one-shot bootstrapper with no long-running process to health-check in the conventional sense) uses `service_completed_successfully` instead (below), while looser dependencies elsewhere in the graph accept `service_started` as sufficient.
 - **`condition: service_completed_successfully`** — wait until the target container has *exited with code 0*. This is the condition used for every one-shot init container this handbook has already encountered — `kafka-init` (Chapter 6), `connect-init` (Chapter 5), and `fraud-engine`'s job-submission step (Chapter 8) — and it's the mechanism that makes the "exited containers are successes, not failures" pattern actually enforceable at the orchestration level, not just documented in a comment: any service depending on `kafka-init` with this condition will not even attempt to start until `kafka-init` has genuinely finished successfully, full stop.
 
-Consolidating every `depends_on` block in `docker-compose.yml` into a single ordering diagram:
+# Startup Order — every `depends_on` edge, verified against `docker-compose.yml`
+
+Extracted programmatically from the file itself, not eyeballed — every edge below is real, and every condition (`started` / `healthy` / `completed`) is the one actually declared for that specific edge (Compose lets each `depends_on` entry declare its own condition, and this repo genuinely mixes them within a single service — e.g. `opensearch-sink` waits for `kafka` and `schema-registry` to merely *start*, but for `opensearch` specifically to be *healthy*).
+
+### Tier 0 — no dependencies
 
 ```text
-                              postgres (healthy)
-                                    │
-                    ┌───────────────┼────────────────┐
-                    ▼                                  ▼
-                  api                           kafka (healthy)
-                                                      │
-                              ┌────────────────────────┼──────────────────────┐
-                              ▼                          ▼                      ▼
-                        schema-registry            kafka-init              (kafka itself)
-                              │                    (completed)
-                              ▼                          │
-                        connect (healthy) ◄───────────────┘
-                              │
-                              ▼
-                        connect-init (completed)
-
-
-      kafka (healthy) + schema-registry (healthy) + opensearch (healthy) + kafka-init (completed)
-                                    │
-                                    ▼
-                           flink-jobmanager (healthy)
-                                    │
-                                    ▼
-                           flink-taskmanager (healthy)
-                                    │
-                                    ▼
-                              fraud-engine (completed)
-
-
-                        kafka (healthy) + schema-registry (healthy)
-                                    │
-                                    ▼
-                              opensearch-sink
-
-
-                              opensearch (healthy)
-                                    │
-                                    ▼
-                        opensearch-dashboards
+postgres          kafka
 ```
+
+### Tier 1
+
+```text
+kafka (healthy) ──► schema-registry
+```
+
+### Tier 2
+
+```text
+kafka (healthy) + postgres (started) + schema-registry (healthy) ──► api
+
+schema-registry (healthy) + postgres (started) ──► connect
+
+kafka (started) ──► kafka-init
+
+kafka (started) ──► kafka-exporter
+```
+
+### Tier 3
+
+```text
+kafka (started) + connect (started) ──► connect-init
+
+connect (healthy) ──► opensearch
+```
+
+### Tier 4
+
+```text
+opensearch (healthy) ──► opensearch-dashboards
+
+kafka (started) + opensearch (healthy) + schema-registry (started) ──► opensearch-sink
+
+api (started) ──► prometheus
+```
+
+### Tier 5
+
+```text
+opensearch-dashboards (started) ──► flink-jobmanager        ← the ONLY dependency
+                                                                flink-jobmanager has.
+                                                                Not kafka. Not schema-
+                                                                registry. Not opensearch.
+                                                                Not kafka-init. Just this.
+
+prometheus (started) ──► grafana
+```
+
+### Tier 6
+
+```text
+flink-jobmanager (healthy) ──► flink-taskmanager
+```
+
+### Tier 7
+
+```text
+flink-jobmanager (healthy) + kafka (healthy) + schema-registry (healthy)
+  + kafka-init (completed) ──► fraud-engine
+
+kafka (healthy) + schema-registry (healthy) + kafka-init (completed)
+  ──► fraud-engine-secondary
+```
+
+Note: `fraud-engine` depends on `flink-jobmanager`, not `flink-taskmanager` —
+Compose's dependency graph has no way to express "and a taskmanager needs to
+actually be available for this job submission to succeed"; that's left to
+Flink's own job-submission retry behavior, not enforced at the container
+level.
+
+### Tier 8
+
+```text
+flink-jobmanager (started) + fraud-engine-secondary (started)
+  ──► fraud-engine-watchdog
+```
+
+---
+
+## Full picture, one diagram
+
+```text
+   Tier 0    postgres              kafka
+                 │                    │
+   Tier 1        │           ┌────────┴────────┐
+                 │           ▼                 (kafka feeds every
+                 │     schema-registry           tier-2+ edge below
+                 │           │                   directly, not just
+   Tier 2        │  ┌────────┼────────┬──────────┴────────┐
+                 │  │        │        │                    │
+                 ▼  ▼        ▼        ▼                    ▼
+                api      connect  kafka-init          kafka-exporter
+                 │           │        │
+   Tier 3        │           ▼        │
+                 │     opensearch ◄───┴── connect-init (also needs kafka)
+                 │           │
+   Tier 4        ▼           ▼
+             prometheus  opensearch-dashboards ──► opensearch-sink
+                 │              │                    (also needs kafka
+   Tier 5        ▼              ▼                     + schema-registry,
+              grafana    flink-jobmanager              both "started" only)
+                                │
+   Tier 6                      ▼
+                        flink-taskmanager
+
+   Tier 7   flink-jobmanager ──┬──► fraud-engine (+ kafka, schema-registry,
+            (healthy)          │                    kafka-init — all required)
+                                └──► fraud-engine-secondary (+ kafka,
+                                        schema-registry, kafka-init)
+
+   Tier 8   flink-jobmanager + fraud-engine-secondary ──► fraud-engine-watchdog
+```
+
+## Why this matters beyond accuracy for its own sake
+
+If you're ever debugging "why is my stack taking forever to come up" or "why did X start before Y was actually ready," the corrected graph tells a different story than the original diagram did:
+
+- **`flink-jobmanager` is gated by `opensearch-dashboards`, full stop.** If OpenSearch Dashboards is slow to report healthy (it has its own dependency on `opensearch` being healthy first), your entire fraud-scoring stack — Flink, the secondary engine's watchdog dependency, everything downstream — waits on it, for no functional reason connected to fraud detection.
+- **Several edges use `service_started`, not `service_healthy`.** `postgres → api`, `kafka`/`schema-registry → opensearch-sink`, and both `connect-init` edges only wait for the *process* to start, not for its healthcheck to pass. In practice this usually works out fine because of how long these images take to actually start listening — but it's not a guarantee, and it's a real, not hypothetical, source of an occasional cold-start race condition.
+- **`fraud-engine-secondary` and `fraud-engine-watchdog` have the exact dependency chain you'd want for the redundancy story** — the secondary engine doesn't wait on Flink at all (correctly independent), and the watchdog is the only thing in the whole graph that depends on *both* engines existing.
 
 **Architectural inference.** The most operationally significant edge in this whole graph is `flink-jobmanager`'s dependency on `opensearch` being *healthy* — not merely started — before the JobManager itself is considered ready to accept job submissions from `fraud-engine`. This is a direct, structural consequence of Chapter 8, §8.5's async OpenSearch lookup being compiled directly into the job's operator graph: even though that lookup doesn't block per-event processing at runtime (it's genuinely asynchronous), the job still needs OpenSearch's endpoint to exist and be reachable at the moment `RichAsyncFunction.open()` initializes its HTTP client. A weaker `service_started` condition here would create a real, if narrow, race window where the Flink cluster reports healthy and `fraud-engine` successfully submits the job, but the job's first several async lookups fail with connection errors until OpenSearch genuinely finishes its own (comparatively slow, per §12.2 below) startup sequence.
 
