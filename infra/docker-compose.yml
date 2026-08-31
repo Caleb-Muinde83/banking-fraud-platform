@@ -68,24 +68,30 @@ configs:
     file: ../grafana/dashboards/fraud-engine-redundancy.json
 
 # =============================================================================
-# Swarm secrets -- postgres credentials only, in this pass. Created OUT OF
-# BAND before `docker stack deploy` runs, e.g.:
+# Swarm secrets. Created OUT OF BAND before `docker stack deploy` runs, e.g.:
 #   printf 'SecureBankPassword2026!' | docker secret create postgres_password -
-# `external: true` means this file only REFERENCES the secret by name; it
-# never contains the credential itself, unlike every other password in this
-# file (KNOWN FOLLOW-UP, not fixed in this pass -- see the changelog at the
-# bottom: api's DATABASE_URL, DEMO_ADMIN_KEY, and the OpenSearch/Grafana
-# admin/admin credentials are all still plaintext environment variables
-# here, exactly as they were in the single-host file. Doing the same fix
-# for api's DATABASE_URL specifically requires either assembling the
-# connection string from a secret-mounted file inside a small entrypoint
-# wrapper, or code changes to api's own database.py to accept the pieces
-# separately -- neither of which has been verified against the live api
-# image in this pass, so it's flagged here rather than silently claimed
-# as done.
+#   printf 'secret-demo-key-99'       | docker secret create demo_admin_key -
+#   printf '<a-real-grafana-password>' | docker secret create grafana_admin_password -
+# `external: true` means this file only REFERENCES each secret by name; it
+# never contains the credential itself.
+#
+# UPDATED (this pass): demo_admin_key and grafana_admin_password added,
+# closing two of the three items the previous changelog flagged as "still
+# plaintext, known follow-up." api/app/core/database.py and
+# api/app/api/demo.py were both updated to support a *_FILE convention
+# (matching postgres-init.sh's existing POSTGRES_PASSWORD_FILE pattern) so
+# these secrets are actually read at runtime, not just declared here for
+# show -- see the `api` and `grafana` service definitions below for the
+# corresponding env var / secrets wiring, and the bottom changelog for the
+# one credential (OpenSearch admin/admin) that is DELIBERATELY NOT touched
+# in this pass, with the reason explained there.
 # =============================================================================
 secrets:
   postgres_password:
+    external: true
+  demo_admin_key:
+    external: true
+  grafana_admin_password:
     external: true
 
 services:
@@ -133,13 +139,27 @@ services:
   api:
     image: banking-api:latest
     environment:
-      # KNOWN FOLLOW-UP (see secrets: block above): this still embeds the
-      # password in plaintext. Not fixed in this pass.
-      DATABASE_URL: postgresql://postgres_admin:SecureBankPassword2026!@postgres:5432/banking_db
+      # CREDENTIAL FIX (this pass): DATABASE_URL is no longer set directly.
+      # api/app/core/database.py only builds DATABASE_URL from these
+      # individual POSTGRES_* pieces when DATABASE_URL itself is absent --
+      # confirmed by reading that file directly, not assumed -- and it now
+      # checks POSTGRES_PASSWORD_FILE first (this pass's change), so the
+      # postgres_password secret already used by the postgres service below
+      # is reused here rather than needing a second copy of the same secret.
+      POSTGRES_USER: postgres_admin
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: banking_db
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
       ENABLE_DEMO_RESET: "true"
-      DEMO_ADMIN_KEY: secret-demo-key-99
+      # CREDENTIAL FIX (this pass): api/app/api/demo.py now checks
+      # DEMO_ADMIN_KEY_FILE first, same convention as above.
+      DEMO_ADMIN_KEY_FILE: /run/secrets/demo_admin_key
+    secrets:
+      - postgres_password
+      - demo_admin_key
     ports:
       - "8000:8000"
     networks:
@@ -351,6 +371,22 @@ services:
       - discovery.type=single-node
       - bootstrap.memory_lock=true
       - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      # CREDENTIAL FIX PASS -- DELIBERATELY NOT CHANGED: OPENSEARCH_USER/
+      # OPENSEARCH_PASSWORD on opensearch-sink and flink-risk-engine below
+      # are still "admin"/"admin". Checked why before deciding whether to
+      # rotate them: DISABLE_SECURITY_PLUGIN=true on THIS service (and on
+      # opensearch-dashboards) means OpenSearch's security plugin -- the
+      # thing that would actually validate those credentials -- is turned
+      # off entirely. Anyone who can reach port 9200 on this node already
+      # has full, unauthenticated read/write access to every index
+      # regardless of what OPENSEARCH_USER/PASSWORD are set to downstream.
+      # Rotating "admin"/"admin" to something else would change nothing
+      # real and risk creating false confidence that this is secured. The
+      # actual fix is enabling the security plugin (TLS certs, a real
+      # admin credential OpenSearch itself checks, role mapping) -- a
+      # meaningfully bigger, separate task, correctly left as a genuine
+      # follow-up rather than faked here with a credential rotation that
+      # wouldn't do anything.
       - DISABLE_SECURITY_PLUGIN=true
     ports:
       - "9200:9200"
@@ -560,8 +596,18 @@ services:
   grafana:
     image: grafana/grafana:10.2.0
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # CREDENTIAL FIX (this pass): grafana/grafana's own image natively
+      # supports a "__FILE" (double underscore) suffix convention for
+      # reading select env vars from a mounted file instead of plaintext --
+      # this is Grafana's own documented mechanism, not something bolted on
+      # here, so no code change was needed for this one (unlike api's two
+      # fixes above). GF_SECURITY_ADMIN_PASSWORD is set once, out of band,
+      # via `docker secret create grafana_admin_password -` before this
+      # secret's first deploy -- change it from "admin" at that point.
+      - GF_SECURITY_ADMIN_PASSWORD__FILE=/run/secrets/grafana_admin_password
       - GF_USERS_ALLOW_SIGN_UP=false
+    secrets:
+      - grafana_admin_password
     configs:
       - source: grafana_datasource_config
         target: /etc/grafana/provisioning/datasources/ds-prometheus.yml
@@ -617,11 +663,15 @@ services:
   # =========================================================================
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.47.2
+    privileged: true
     volumes:
       - /:/rootfs:ro
-      - /var/run:/var/run:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
     networks:
       - fraud_network
     ports:
@@ -636,8 +686,22 @@ services:
           memory: 200M
       restart_policy:
         condition: on-failure
-    # Same note as the single-host file: /dev/kmsg + privileged are omitted;
-    # add them for full OOM-event coverage on a confirmed-Linux node.
+    # UPDATED (this pass): the single-host docker-compose.yml deliberately
+    # omits privileged/kmsg/an explicit docker.sock mount, because we
+    # confirmed directly (curl-ing cAdvisor's own /metrics and grepping for
+    # container_cpu_usage_seconds_total{name=~"bank_.+"}) that even with all
+    # three of those, cAdvisor still couldn't resolve container names under
+    # Docker Desktop's WSL2 backend -- every real container's metrics carried
+    # only a raw cgroup `id`, never a `name` or `container_label_*`. That's a
+    # confirmed platform limitation of WSL2 specifically, not of this
+    # combination of flags in general. k3s-master/k3s-worker-2/k3s-worker-3
+    # are real Linux hosts, where this exact combination (privileged +
+    # /dev/kmsg + an explicit docker.sock mount, matching the standard
+    # upstream cAdvisor recipe) is expected to work correctly and should be
+    # verified with the same curl check once this is actually deployed --
+    # if it does, the per-container Grafana panels that were removed from
+    # cluster-resource-usage.json for the WSL2 deployment (see that file's
+    # own explanatory text panel) are worth re-adding for this one.
 
   node-exporter:
     image: prom/node-exporter:v1.7.0
@@ -700,4 +764,43 @@ volumes:
 #     why the single-host file's container-name-based targets wouldn't work
 #     here). Every other job in it is identical in substance, just
 #     addressed by Swarm service name instead of container_name.
+# =============================================================================
+
+# =============================================================================
+# CHANGELOG -- second pass (credentials + cadvisor)
+# =============================================================================
+# FIXED (were plaintext, now secret-backed):
+#   - api's DATABASE_URL -> removed entirely. api/app/core/database.py now
+#     builds the connection string from POSTGRES_USER/HOST/PORT/DB plus
+#     POSTGRES_PASSWORD_FILE (new code change, mirrors postgres-init.sh's
+#     existing convention), reusing the SAME postgres_password secret the
+#     postgres service already uses -- no second copy of that secret needed.
+#   - api's DEMO_ADMIN_KEY -> DEMO_ADMIN_KEY_FILE, backed by a new
+#     demo_admin_key secret. Required a small code change to
+#     api/app/api/demo.py to check the _FILE variant first.
+#   - grafana's GF_SECURITY_ADMIN_PASSWORD -> GF_SECURITY_ADMIN_PASSWORD__FILE,
+#     backed by a new grafana_admin_password secret. No code change needed --
+#     this is Grafana's own natively-documented "__FILE" convention.
+#
+# DELIBERATELY NOT CHANGED, WITH REASON (not an oversight):
+#   - OpenSearch admin/admin (on opensearch-sink and flink-risk-engine) --
+#     both opensearch and opensearch-dashboards run with
+#     DISABLE_SECURITY_PLUGIN=true, so OpenSearch never actually validates
+#     these credentials in the first place. Rotating "admin"/"admin" to
+#     something else would fix nothing real and risks looking like a fix
+#     when it isn't one. The actual fix -- enabling OpenSearch's security
+#     plugin, which needs TLS certs and role mapping -- is a meaningfully
+#     bigger task, correctly scoped as a separate follow-up rather than
+#     faked here. See the long comment on the opensearch service itself.
+#
+# CADVISOR -- upgraded from "omitted, same as single-host file" to the full
+# recipe (privileged: true, /dev/kmsg device, explicit docker.sock mount,
+# /dev/disk mount), because the reason those were omitted on the single-host
+# file was a CONFIRMED Docker Desktop/WSL2-specific limitation (verified via
+# curl against cAdvisor's own /metrics -- container names never resolved
+# even with every flag enabled), not a general property of this flag
+# combination. k3s-master/k3s-worker-2/k3s-worker-3 are real Linux hosts,
+# where this combination is expected to work correctly per cAdvisor's own
+# standard recipe -- worth the same curl-based verification once deployed,
+# per the comment on the cadvisor service above, before assuming it's fixed.
 # =============================================================================
