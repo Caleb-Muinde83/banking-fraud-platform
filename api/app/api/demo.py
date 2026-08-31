@@ -94,7 +94,16 @@ async def reset_demo_environment(
         )
 
     # Guard 2: Admin Key Validation
-    expected_key = os.getenv("DEMO_ADMIN_KEY", "secret-demo-key-99")
+    # SWARM CREDENTIAL FIX: same _FILE convention as postgres-init.sh and
+    # core/database.py -- read from a mounted Swarm secret if present,
+    # falling back to the plaintext env var (and then the hardcoded
+    # default) so the single-host docker-compose.yml is unaffected.
+    _demo_key_file = os.getenv("DEMO_ADMIN_KEY_FILE")
+    if _demo_key_file and os.path.isfile(_demo_key_file):
+        with open(_demo_key_file) as f:
+            expected_key = f.read().strip()
+    else:
+        expected_key = os.getenv("DEMO_ADMIN_KEY", "secret-demo-key-99")
     if x_demo_admin_key != expected_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
